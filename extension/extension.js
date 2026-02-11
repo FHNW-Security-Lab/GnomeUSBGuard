@@ -314,10 +314,43 @@ class UsbGuardPromptRuntime {
         return lastSeen !== undefined && now - lastSeen < REPEAT_INSERT_SUPPRESS_USEC;
     }
 
+    _extractRootPort(viaPort) {
+        if (!viaPort)
+            return '';
+
+        // "3-1.4.2" -> "3-1". This identifies the physical upstream plug event.
+        const match = viaPort.match(/^(\d+-\d+)/);
+        return match ? match[1] : viaPort;
+    }
+
     _groupKeyForDevice(device) {
+        const rootPort = this._extractRootPort(device.viaPort);
+        if (rootPort)
+            return `root-port:${rootPort}`;
+
+        if (device.parentHash)
+            return `parent:${device.parentHash}`;
+
         if (device.isHub)
             return `hub:${device.hash}`;
+
         return `device:${device.hash}`;
+    }
+
+    _scheduleGroupTimer(groupKey, group) {
+        if (group.timerId > 0)
+            GLib.source_remove(group.timerId);
+
+        group.timerId = GLib.timeout_add(
+            GLib.PRIORITY_DEFAULT,
+            HUB_PROMPT_DEBOUNCE_MS,
+            () => {
+                this._pendingPromptGroups.delete(groupKey);
+                group.timerId = 0;
+                this._showPromptForGroup(group);
+                return GLib.SOURCE_REMOVE;
+            }
+        );
     }
 
     _queuePrompt(device) {
@@ -328,22 +361,11 @@ class UsbGuardPromptRuntime {
                 timerId: 0,
                 devicesByHash: new Map(),
             };
-
-            group.timerId = GLib.timeout_add(
-                GLib.PRIORITY_DEFAULT,
-                HUB_PROMPT_DEBOUNCE_MS,
-                () => {
-                    this._pendingPromptGroups.delete(groupKey);
-                    group.timerId = 0;
-                    this._showPromptForGroup(group);
-                    return GLib.SOURCE_REMOVE;
-                }
-            );
-
             this._pendingPromptGroups.set(groupKey, group);
         }
 
         group.devicesByHash.set(device.hash, device);
+        this._scheduleGroupTimer(groupKey, group);
     }
 
     _showPromptForGroup(group) {
