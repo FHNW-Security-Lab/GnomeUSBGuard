@@ -75,10 +75,16 @@ function rewriteRuleTarget(ruleText, newTarget) {
     return `${newTarget} ${ruleText}`.trim();
 }
 
-function shorten(text, maxLength = 160) {
-    if (text.length <= maxLength)
-        return text;
-    return `${text.slice(0, maxLength - 3)}...`;
+function compactValue(text, keepHead = 10, keepTail = 8) {
+    const value = String(text ?? '');
+    if (!value)
+        return '';
+
+    const minLength = keepHead + keepTail + 3;
+    if (value.length <= minLength)
+        return value;
+
+    return `${value.slice(0, keepHead)}...${value.slice(-keepTail)}`;
 }
 
 function formatDbusError(error) {
@@ -228,7 +234,7 @@ class USBGuardClient {
 export default class UsbGuardPromptPreferences extends ExtensionPreferences {
     fillPreferencesWindow(window) {
         this._window = window;
-        this._actionButtons = [];
+        this._actionWidgets = [];
         this._deviceRows = [];
         this._ruleRows = [];
         this._busy = false;
@@ -330,20 +336,52 @@ export default class UsbGuardPromptPreferences extends ExtensionPreferences {
         if (this._refreshButton)
             this._refreshButton.set_sensitive(!busy);
 
-        for (const button of this._actionButtons)
-            button.set_sensitive(!busy);
+        for (const widget of this._actionWidgets)
+            widget.set_sensitive(!busy);
+    }
+
+    _registerActionWidget(widget) {
+        this._actionWidgets.push(widget);
+        widget.set_sensitive(!this._busy);
+        return widget;
     }
 
     _registerActionButton(button) {
-        this._actionButtons.push(button);
-        button.set_sensitive(!this._busy);
-        return button;
+        return this._registerActionWidget(button);
     }
 
     _clearGroupRows(group, rowsList) {
         for (const row of rowsList)
             group.remove(row);
         rowsList.length = 0;
+    }
+
+    _createActionSelector(actionLabels) {
+        const stringList = Gtk.StringList.new(actionLabels);
+        const dropdown = this._registerActionWidget(new Gtk.DropDown({
+            model: stringList,
+            selected: 0,
+            valign: Gtk.Align.CENTER,
+        }));
+
+        const applyButton = this._registerActionButton(new Gtk.Button({
+            label: 'Apply',
+            valign: Gtk.Align.CENTER,
+        }));
+
+        const actionBox = new Gtk.Box({
+            orientation: Gtk.Orientation.HORIZONTAL,
+            spacing: 6,
+            valign: Gtk.Align.CENTER,
+        });
+        actionBox.append(dropdown);
+        actionBox.append(applyButton);
+
+        return {
+            actionBox,
+            dropdown,
+            applyButton,
+        };
     }
 
     _setStatus(message) {
@@ -382,81 +420,73 @@ export default class UsbGuardPromptPreferences extends ExtensionPreferences {
             const subtitleParts = [
                 `id=${deviceId}`,
                 parsed.usbId ? `usb-id=${parsed.usbId}` : null,
-                parsed.serial ? `serial=${parsed.serial}` : null,
-                parsed.hash ? `hash=${parsed.hash}` : null,
+                parsed.serial ? `serial=${compactValue(parsed.serial, 8, 4)}` : null,
+                parsed.hash ? `hash=${compactValue(parsed.hash, 8, 6)}` : null,
             ].filter(Boolean);
 
             const row = new Adw.ActionRow({
                 title,
                 subtitle: subtitleParts.join(' | '),
             });
+            if (typeof row.set_subtitle_lines === 'function')
+                row.set_subtitle_lines(1);
+            if (typeof row.set_title_lines === 'function')
+                row.set_title_lines(1);
+            row.set_tooltip_text(parsed.rawText);
 
-            const allowOnceButton = this._registerActionButton(new Gtk.Button({
-                label: 'Allow once',
-                valign: Gtk.Align.CENTER,
-            }));
-            allowOnceButton.connect('clicked', () => {
+            const actions = [
+                {
+                    label: 'Allow once',
+                    run: async () => {
+                        await this._client.applyDevicePolicy(deviceId, 'allow', false);
+                        this._setStatus(`Applied "allow once" to ${title}.`);
+                    },
+                },
+                {
+                    label: 'Allow always',
+                    run: async () => {
+                        await this._client.applyDevicePolicy(deviceId, 'allow', true);
+                        this._setStatus(`Applied permanent allow to ${title}.`);
+                    },
+                },
+                {
+                    label: 'Block once',
+                    run: async () => {
+                        await this._client.applyDevicePolicy(deviceId, 'block', false);
+                        this._setStatus(`Applied "block once" to ${title}.`);
+                    },
+                },
+                {
+                    label: 'Block permanent',
+                    run: async () => {
+                        await this._client.applyDevicePolicy(deviceId, 'block', true);
+                        this._setStatus(`Applied permanent block to ${title}.`);
+                    },
+                },
+                {
+                    label: 'Reset rules',
+                    run: async () => {
+                        await this._resetRulesForDevice(title, parsed);
+                    },
+                },
+            ];
+
+            const {
+                actionBox,
+                dropdown,
+                applyButton,
+            } = this._createActionSelector(actions.map(action => action.label));
+
+            applyButton.connect('clicked', () => {
+                const selected = Math.max(0, dropdown.get_selected());
+                const action = actions[selected] ?? actions[0];
                 void this._runBusyTask(async () => {
-                    await this._client.applyDevicePolicy(deviceId, 'allow', false);
-                    this._setStatus(`Applied "allow once" to ${title}.`);
+                    await action.run();
                     await this._refreshAll();
                 });
             });
 
-            const allowAlwaysButton = this._registerActionButton(new Gtk.Button({
-                label: 'Allow always',
-                valign: Gtk.Align.CENTER,
-            }));
-            allowAlwaysButton.add_css_class('suggested-action');
-            allowAlwaysButton.connect('clicked', () => {
-                void this._runBusyTask(async () => {
-                    await this._client.applyDevicePolicy(deviceId, 'allow', true);
-                    this._setStatus(`Applied permanent allow to ${title}.`);
-                    await this._refreshAll();
-                });
-            });
-
-            const blockOnceButton = this._registerActionButton(new Gtk.Button({
-                label: 'Block once',
-                valign: Gtk.Align.CENTER,
-            }));
-            blockOnceButton.connect('clicked', () => {
-                void this._runBusyTask(async () => {
-                    await this._client.applyDevicePolicy(deviceId, 'block', false);
-                    this._setStatus(`Applied "block once" to ${title}.`);
-                    await this._refreshAll();
-                });
-            });
-
-            const blockPermanentButton = this._registerActionButton(new Gtk.Button({
-                label: 'Block permanent',
-                valign: Gtk.Align.CENTER,
-            }));
-            blockPermanentButton.add_css_class('destructive-action');
-            blockPermanentButton.connect('clicked', () => {
-                void this._runBusyTask(async () => {
-                    await this._client.applyDevicePolicy(deviceId, 'block', true);
-                    this._setStatus(`Applied permanent block to ${title}.`);
-                    await this._refreshAll();
-                });
-            });
-
-            const resetRulesButton = this._registerActionButton(new Gtk.Button({
-                label: 'Reset rules',
-                valign: Gtk.Align.CENTER,
-            }));
-            resetRulesButton.connect('clicked', () => {
-                void this._runBusyTask(async () => {
-                    await this._resetRulesForDevice(title, parsed);
-                    await this._refreshAll();
-                });
-            });
-
-            row.add_suffix(allowOnceButton);
-            row.add_suffix(allowAlwaysButton);
-            row.add_suffix(blockOnceButton);
-            row.add_suffix(blockPermanentButton);
-            row.add_suffix(resetRulesButton);
+            row.add_suffix(actionBox);
 
             this._devicesGroup.add(row);
             this._deviceRows.push(row);
@@ -514,67 +544,69 @@ export default class UsbGuardPromptPreferences extends ExtensionPreferences {
         for (const [ruleId, ruleText] of rules) {
             const parsed = parseRuleText(ruleText);
             const title = parsed.name || parsed.hash || parsed.usbId || `Rule ${ruleId}`;
-            const subtitle = `#${ruleId} | target=${parsed.target} | ${shorten(parsed.rawText)}`;
+            const subtitleParts = [
+                `#${ruleId}`,
+                `target=${parsed.target}`,
+                parsed.usbId ? `usb-id=${parsed.usbId}` : null,
+                parsed.serial ? `serial=${compactValue(parsed.serial, 8, 4)}` : null,
+                parsed.hash ? `hash=${compactValue(parsed.hash, 8, 6)}` : null,
+            ].filter(Boolean);
+            const subtitle = subtitleParts.join(' | ');
 
             const row = new Adw.ActionRow({
                 title,
                 subtitle,
             });
+            if (typeof row.set_subtitle_lines === 'function')
+                row.set_subtitle_lines(1);
+            if (typeof row.set_title_lines === 'function')
+                row.set_title_lines(1);
+            row.set_tooltip_text(parsed.rawText);
 
-            const allowButton = this._registerActionButton(new Gtk.Button({
-                label: 'Allow',
-                valign: Gtk.Align.CENTER,
-            }));
-            allowButton.connect('clicked', () => {
+            const actions = [
+                {
+                    label: 'Set Allow',
+                    run: async () => {
+                        await this._changeRuleTarget(ruleId, ruleText, 'allow');
+                    },
+                },
+                {
+                    label: 'Set Block',
+                    run: async () => {
+                        await this._changeRuleTarget(ruleId, ruleText, 'block');
+                    },
+                },
+                {
+                    label: 'Set Reject',
+                    run: async () => {
+                        await this._changeRuleTarget(ruleId, ruleText, 'reject');
+                    },
+                },
+                {
+                    label: 'Delete rule',
+                    run: async () => {
+                        await this._client.removeRule(ruleId);
+                        this._setStatus(`Deleted rule #${ruleId}.`);
+                    },
+                },
+            ];
+
+            const {
+                actionBox,
+                dropdown,
+                applyButton,
+            } = this._createActionSelector(actions.map(action => action.label));
+
+            applyButton.connect('clicked', () => {
+                const selected = Math.max(0, dropdown.get_selected());
+                const action = actions[selected] ?? actions[0];
                 void this._runBusyTask(async () => {
-                    await this._changeRuleTarget(ruleId, ruleText, 'allow');
+                    await action.run();
                     await this._refreshAll();
                 });
             });
 
-            const blockButton = this._registerActionButton(new Gtk.Button({
-                label: 'Block',
-                valign: Gtk.Align.CENTER,
-            }));
-            blockButton.connect('clicked', () => {
-                void this._runBusyTask(async () => {
-                    await this._changeRuleTarget(ruleId, ruleText, 'block');
-                    await this._refreshAll();
-                });
-            });
-
-            const rejectButton = this._registerActionButton(new Gtk.Button({
-                label: 'Reject',
-                valign: Gtk.Align.CENTER,
-            }));
-            rejectButton.connect('clicked', () => {
-                void this._runBusyTask(async () => {
-                    await this._changeRuleTarget(ruleId, ruleText, 'reject');
-                    await this._refreshAll();
-                });
-            });
-
-            const removeButton = this._registerActionButton(new Gtk.Button({
-                label: 'Delete',
-                valign: Gtk.Align.CENTER,
-            }));
-            removeButton.add_css_class('destructive-action');
-            removeButton.connect('clicked', () => {
-                void this._runBusyTask(async () => {
-                    await this._client.removeRule(ruleId);
-                    this._setStatus(`Deleted rule #${ruleId}.`);
-                    await this._refreshAll();
-                });
-            });
-
-            allowButton.set_sensitive(parsed.target !== 'allow' && !this._busy);
-            blockButton.set_sensitive(parsed.target !== 'block' && !this._busy);
-            rejectButton.set_sensitive(parsed.target !== 'reject' && !this._busy);
-
-            row.add_suffix(allowButton);
-            row.add_suffix(blockButton);
-            row.add_suffix(rejectButton);
-            row.add_suffix(removeButton);
+            row.add_suffix(actionBox);
 
             this._rulesGroup.add(row);
             this._ruleRows.push(row);
