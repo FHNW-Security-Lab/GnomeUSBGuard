@@ -1,0 +1,10 @@
+{
+  "uuid": "usbguard-prompt@blacksheeep",
+  "name": "USBGuard Prompt",
+  "description": "Prompt to authorize newly inserted USB devices through USBGuard.",
+  "shell-version": [
+    "49"
+  ],
+  "version": 3
+}
+
