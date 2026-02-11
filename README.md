@@ -15,6 +15,8 @@ The action buttons map to `org.usbguard.Devices.applyDevicePolicy(...)`.
 ## Behavior
 
 - The extension subscribes to `DevicePresenceChanged` on `org.usbguard.Devices`.
+- It auto-detects both USBGuard D-Bus variants (`org.usbguard1` and legacy
+  `org.usbguard`).
 - It only reacts to `Insert` events.
 - For hubs, notifications are de-duplicated so a single hub insertion does not
   flood you with many prompts.

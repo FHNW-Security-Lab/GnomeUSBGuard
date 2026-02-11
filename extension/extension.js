@@ -5,12 +5,19 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as MessageTray from 'resource:///org/gnome/shell/ui/messageTray.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
-const USBGUARD_BUS_NAME = 'org.usbguard';
-const USBGUARD_DEVICES_INTERFACE = 'org.usbguard.Devices';
-const USBGUARD_SIGNAL_OBJECT_PATH = '/org/usbguard/Devices';
-const USBGUARD_METHOD_OBJECT_PATHS = [
-    '/org/usbguard',
-    '/org/usbguard/Devices',
+const USBGUARD_BACKENDS = [
+    {
+        busName: 'org.usbguard1',
+        devicesInterface: 'org.usbguard.Devices1',
+        signalObjectPath: '/org/usbguard1/Devices',
+        methodObjectPaths: ['/org/usbguard1/Devices'],
+    },
+    {
+        busName: 'org.usbguard',
+        devicesInterface: 'org.usbguard.Devices',
+        signalObjectPath: '/org/usbguard/Devices',
+        methodObjectPaths: ['/org/usbguard', '/org/usbguard/Devices'],
+    },
 ];
 const SCREENSAVER_BUS_NAME = 'org.gnome.ScreenSaver';
 const SCREENSAVER_INTERFACE = 'org.gnome.ScreenSaver';
@@ -67,6 +74,7 @@ class UsbGuardPromptRuntime {
         Main.messageTray.add(this._source);
 
         this._bus = null;
+        this._usbguardBackend = null;
         this._sessionBus = null;
         this._signalSubscriptionId = 0;
         this._screenSignalSubscriptionId = 0;
@@ -83,11 +91,20 @@ class UsbGuardPromptRuntime {
             return;
         }
 
+        this._usbguardBackend = this._detectUsbguardBackend();
+        if (!this._usbguardBackend) {
+            Main.notifyError(
+                'USBGuard Prompt',
+                'USBGuard D-Bus service not found (expected org.usbguard1 or org.usbguard).'
+            );
+            return;
+        }
+
         this._signalSubscriptionId = this._bus.signal_subscribe(
-            USBGUARD_BUS_NAME,
-            USBGUARD_DEVICES_INTERFACE,
+            this._usbguardBackend.busName,
+            this._usbguardBackend.devicesInterface,
             'DevicePresenceChanged',
-            USBGUARD_SIGNAL_OBJECT_PATH,
+            this._usbguardBackend.signalObjectPath,
             null,
             Gio.DBusSignalFlags.NONE,
             this._onDevicePresenceChanged.bind(this)
@@ -123,6 +140,7 @@ class UsbGuardPromptRuntime {
         }
 
         this._bus = null;
+        this._usbguardBackend = null;
         this._sessionBus = null;
         logInfo('Extension disabled');
     }
@@ -142,6 +160,35 @@ class UsbGuardPromptRuntime {
         }
 
         this._queuePrompt(device);
+    }
+
+    _detectUsbguardBackend() {
+        for (const backend of USBGUARD_BACKENDS) {
+            if (this._hasBusOwner(backend.busName))
+                return backend;
+        }
+        return null;
+    }
+
+    _hasBusOwner(busName) {
+        try {
+            const response = this._bus.call_sync(
+                'org.freedesktop.DBus',
+                '/org/freedesktop/DBus',
+                'org.freedesktop.DBus',
+                'NameHasOwner',
+                new GLib.Variant('(s)', [busName]),
+                new GLib.VariantType('(b)'),
+                Gio.DBusCallFlags.NONE,
+                DBUS_CALL_TIMEOUT_MS,
+                null
+            );
+            const [hasOwner] = response.deepUnpack();
+            return Boolean(hasOwner);
+        } catch (error) {
+            logException(error, `Failed to query D-Bus owner for ${busName}`);
+            return false;
+        }
     }
 
     _setupScreenLockTracking() {
@@ -400,11 +447,14 @@ class UsbGuardPromptRuntime {
     }
 
     async _applyDevicePolicy(deviceId, target, permanent) {
+        if (!this._usbguardBackend)
+            throw new Error('USBGuard backend not initialized');
+
         const args = new GLib.Variant('(uub)', [deviceId, target, permanent]);
         const replyType = new GLib.VariantType('(u)');
 
         let lastError = null;
-        for (const objectPath of USBGUARD_METHOD_OBJECT_PATHS) {
+        for (const objectPath of this._usbguardBackend.methodObjectPaths) {
             try {
                 await this._callUsbguardMethod(objectPath, 'applyDevicePolicy', args, replyType);
                 return;
@@ -419,9 +469,9 @@ class UsbGuardPromptRuntime {
     _callUsbguardMethod(objectPath, methodName, parameters, replyType) {
         return new Promise((resolve, reject) => {
             this._bus.call(
-                USBGUARD_BUS_NAME,
+                this._usbguardBackend.busName,
                 objectPath,
-                USBGUARD_DEVICES_INTERFACE,
+                this._usbguardBackend.devicesInterface,
                 methodName,
                 parameters,
                 replyType,

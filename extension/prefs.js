@@ -5,16 +5,23 @@ import Gtk from 'gi://Gtk';
 
 import {ExtensionPreferences} from 'resource:///org/gnome/Shell/Extensions/js/extensions/prefs.js';
 
-const USBGUARD_BUS_NAME = 'org.usbguard';
-const USBGUARD_DEVICES_INTERFACE = 'org.usbguard.Devices';
-const USBGUARD_POLICY_INTERFACE = 'org.usbguard.Policy';
-const USBGUARD_DEVICE_PATHS = [
-    '/org/usbguard',
-    '/org/usbguard/Devices',
-];
-const USBGUARD_POLICY_PATHS = [
-    '/org/usbguard/Devices',
-    '/org/usbguard',
+const USBGUARD_BACKENDS = [
+    {
+        busName: 'org.usbguard1',
+        devicesInterface: 'org.usbguard.Devices1',
+        policyInterface: 'org.usbguard.Policy1',
+        devicePaths: ['/org/usbguard1/Devices'],
+        policyPaths: ['/org/usbguard1/Policy'],
+        appendRuleHasTemporary: true,
+    },
+    {
+        busName: 'org.usbguard',
+        devicesInterface: 'org.usbguard.Devices',
+        policyInterface: 'org.usbguard.Policy',
+        devicePaths: ['/org/usbguard', '/org/usbguard/Devices'],
+        policyPaths: ['/org/usbguard/Devices', '/org/usbguard'],
+        appendRuleHasTemporary: false,
+    },
 ];
 
 const TARGET_NAME_TO_NUMERIC = {
@@ -83,12 +90,16 @@ function formatDbusError(error) {
 class USBGuardClient {
     constructor() {
         this._bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, null);
+        this._backend = this._detectBackend();
+        if (!this._backend) {
+            throw new Error('USBGuard D-Bus service not found (expected org.usbguard1 or org.usbguard)');
+        }
     }
 
     async listDevices() {
         const response = await this._callMethod(
-            USBGUARD_DEVICE_PATHS,
-            USBGUARD_DEVICES_INTERFACE,
+            this._backend.devicePaths,
+            this._backend.devicesInterface,
             'listDevices',
             new GLib.Variant('(s)', ['match']),
             new GLib.VariantType('(a(us))')
@@ -103,8 +114,8 @@ class USBGuardClient {
             throw new Error(`Unsupported target "${targetName}"`);
 
         await this._callMethod(
-            USBGUARD_DEVICE_PATHS,
-            USBGUARD_DEVICES_INTERFACE,
+            this._backend.devicePaths,
+            this._backend.devicesInterface,
             'applyDevicePolicy',
             new GLib.Variant('(uub)', [deviceId, target, permanent]),
             new GLib.VariantType('(u)')
@@ -113,8 +124,8 @@ class USBGuardClient {
 
     async listRules() {
         const response = await this._callMethod(
-            USBGUARD_POLICY_PATHS,
-            USBGUARD_POLICY_INTERFACE,
+            this._backend.policyPaths,
+            this._backend.policyInterface,
             'listRules',
             new GLib.Variant('(s)', ['']),
             new GLib.VariantType('(a(us))')
@@ -124,11 +135,15 @@ class USBGuardClient {
     }
 
     async appendRule(ruleText, parentId = 0) {
+        const parameters = this._backend.appendRuleHasTemporary
+            ? new GLib.Variant('(sub)', [ruleText, parentId, false])
+            : new GLib.Variant('(su)', [ruleText, parentId]);
+
         const response = await this._callMethod(
-            USBGUARD_POLICY_PATHS,
-            USBGUARD_POLICY_INTERFACE,
+            this._backend.policyPaths,
+            this._backend.policyInterface,
             'appendRule',
-            new GLib.Variant('(su)', [ruleText, parentId]),
+            parameters,
             new GLib.VariantType('(u)')
         );
         const [ruleId] = response.deepUnpack();
@@ -137,12 +152,41 @@ class USBGuardClient {
 
     async removeRule(ruleId) {
         await this._callMethod(
-            USBGUARD_POLICY_PATHS,
-            USBGUARD_POLICY_INTERFACE,
+            this._backend.policyPaths,
+            this._backend.policyInterface,
             'removeRule',
             new GLib.Variant('(u)', [ruleId]),
             null
         );
+    }
+
+    _detectBackend() {
+        for (const backend of USBGUARD_BACKENDS) {
+            if (this._hasBusOwner(backend.busName))
+                return backend;
+        }
+        return null;
+    }
+
+    _hasBusOwner(busName) {
+        try {
+            const response = this._bus.call_sync(
+                'org.freedesktop.DBus',
+                '/org/freedesktop/DBus',
+                'org.freedesktop.DBus',
+                'NameHasOwner',
+                new GLib.Variant('(s)', [busName]),
+                new GLib.VariantType('(b)'),
+                Gio.DBusCallFlags.NONE,
+                3000,
+                null
+            );
+            const [hasOwner] = response.deepUnpack();
+            return Boolean(hasOwner);
+        } catch (error) {
+            logError(error, `[usbguard-prompt] Failed to query owner for ${busName}`);
+            return false;
+        }
     }
 
     async _callMethod(objectPaths, interfaceName, methodName, parameters, replyType) {
@@ -160,7 +204,7 @@ class USBGuardClient {
     _callMethodOnce(objectPath, interfaceName, methodName, parameters, replyType) {
         return new Promise((resolve, reject) => {
             this._bus.call(
-                USBGUARD_BUS_NAME,
+                this._backend.busName,
                 objectPath,
                 interfaceName,
                 methodName,
