@@ -78,7 +78,6 @@ gnome-extensions prefs usbguard-prompt@blacksheeep
 
 In preferences you can:
 
-- snapshot the current connected devices as trusted baseline (`Accept baseline`)
 - change policy for connected devices (`Allow once`, `Allow always`, `Block once`, `Block permanent`)
 - reset matching permanent rules for a device (`Reset rules`)
 - edit permanent rules (`Allow`, `Block`, `Reject`)

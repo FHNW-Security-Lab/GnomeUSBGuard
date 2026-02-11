@@ -288,24 +288,6 @@ export default class UsbGuardPromptPreferences extends ExtensionPreferences {
         refreshRow.add_suffix(this._refreshButton);
         controlsGroup.add(refreshRow);
 
-        const baselineRow = new Adw.ActionRow({
-            title: 'Accept current devices as baseline',
-            subtitle: 'Permanently allow all currently connected devices. Unplug removable devices first if needed.',
-        });
-        this._baselineButton = this._registerActionButton(new Gtk.Button({
-            label: 'Accept baseline',
-            valign: Gtk.Align.CENTER,
-        }));
-        this._baselineButton.add_css_class('suggested-action');
-        this._baselineButton.connect('clicked', () => {
-            void this._runBusyTask(async () => {
-                await this._acceptCurrentStateAsBaseline();
-                await this._refreshAll();
-            });
-        });
-        baselineRow.add_suffix(this._baselineButton);
-        controlsGroup.add(baselineRow);
-
         this._statusRow = new Adw.ActionRow({
             title: 'Status',
             subtitle: 'Loading USBGuard data...',
@@ -416,39 +398,6 @@ export default class UsbGuardPromptPreferences extends ExtensionPreferences {
         this._renderDevices(devices);
         this._renderRules(rules);
         this._setStatus(`Loaded ${devices.length} connected devices and ${rules.length} permanent rules.`);
-    }
-
-    async _acceptCurrentStateAsBaseline() {
-        const devices = await this._client.listDevices();
-        if (devices.length === 0) {
-            this._setStatus('No connected devices found. Nothing to baseline.');
-            return;
-        }
-
-        const failedDevices = [];
-        let appliedCount = 0;
-
-        for (const [deviceId, deviceRule] of devices) {
-            try {
-                await this._client.applyDevicePolicy(deviceId, 'allow', true);
-                appliedCount += 1;
-            } catch (error) {
-                const parsed = parseRuleText(deviceRule);
-                failedDevices.push(parsed.name || parsed.usbId || `id=${deviceId}`);
-                logError(error, `[usbguard-prompt] Failed to baseline device ${deviceId}`);
-            }
-        }
-
-        if (failedDevices.length === 0) {
-            this._setStatus(`Baseline saved: ${appliedCount} connected device(s) permanently allowed.`);
-            return;
-        }
-
-        const preview = failedDevices.slice(0, 3).join(', ');
-        const moreCount = failedDevices.length > 3 ? ` (+${failedDevices.length - 3} more)` : '';
-        this._setStatus(
-            `Baseline partially applied (${appliedCount}/${devices.length}). Failed: ${preview}${moreCount}`
-        );
     }
 
     _renderDevices(devices) {
