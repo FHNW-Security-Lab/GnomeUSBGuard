@@ -19,6 +19,8 @@ The action buttons map to `org.usbguard.Devices.applyDevicePolicy(...)`.
 - It only reacts to `Insert` events.
 - For hubs, notifications are de-duplicated so a single hub insertion does not
   flood you with many prompts.
+- Companion USB2/USB3 function devices from one physical plug event (for
+  example hub + card reader functions) are grouped into one prompt burst.
 - Devices connected through the hub later are prompted again as separate
   devices.
 - If the screen is locked, newly inserted devices are immediately **blocked once**

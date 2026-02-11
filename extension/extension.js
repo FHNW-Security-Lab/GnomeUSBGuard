@@ -24,7 +24,7 @@ const SCREENSAVER_INTERFACE = 'org.gnome.ScreenSaver';
 const SCREENSAVER_OBJECT_PATH = '/org/gnome/ScreenSaver';
 
 const INSERT_EVENT = 1;
-const HUB_PROMPT_DEBOUNCE_MS = 1200;
+const HUB_PROMPT_DEBOUNCE_MS = 2200;
 const REPEAT_INSERT_SUPPRESS_USEC = 3 * 1000 * 1000;
 const DBUS_CALL_TIMEOUT_MS = 2500;
 
@@ -314,19 +314,30 @@ class UsbGuardPromptRuntime {
         return lastSeen !== undefined && now - lastSeen < REPEAT_INSERT_SUPPRESS_USEC;
     }
 
-    _extractRootPort(viaPort) {
+    _extractPortPath(viaPort) {
         if (!viaPort)
             return '';
 
-        // "3-1.4.2" -> "3-1". This identifies the physical upstream plug event.
-        const match = viaPort.match(/^(\d+-\d+)/);
+        // "3-1.4.2" -> "1.4.2"
+        const match = viaPort.match(/^\d+-(.+)$/);
         return match ? match[1] : viaPort;
     }
 
+    _extractCompanionRoot(viaPort) {
+        const portPath = this._extractPortPath(viaPort);
+        if (!portPath)
+            return '';
+
+        // "1.4.2" -> "1"; "1" -> "1"
+        return portPath.split('.')[0];
+    }
+
     _groupKeyForDevice(device) {
-        const rootPort = this._extractRootPort(device.viaPort);
-        if (rootPort)
-            return `root-port:${rootPort}`;
+        // Group USB2/USB3 companion interfaces for the same physical insertion.
+        // Example: "3-1.x" and "4-1.x" both map to "companion-root:1".
+        const companionRoot = this._extractCompanionRoot(device.viaPort);
+        if (companionRoot)
+            return `companion-root:${companionRoot}`;
 
         if (device.parentHash)
             return `parent:${device.parentHash}`;
