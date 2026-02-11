@@ -6,7 +6,6 @@ system D-Bus and prompts when USB devices are inserted.
 Each prompt provides:
 
 - `Block once`
-- `Block permanently`
 - `Allow once`
 - `Allow always`
 

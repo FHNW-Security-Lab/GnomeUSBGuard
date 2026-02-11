@@ -397,9 +397,6 @@ class UsbGuardPromptRuntime {
         addAction('Block once', () => {
             void this._applyDecision(devices, PolicyTarget.BLOCK, false);
         });
-        addAction('Block permanently', () => {
-            void this._applyDecision(devices, PolicyTarget.BLOCK, true);
-        });
         addAction('Allow once', () => {
             void this._applyDecision(devices, PolicyTarget.ALLOW, false);
         });
