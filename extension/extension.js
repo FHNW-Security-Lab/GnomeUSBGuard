@@ -1169,18 +1169,25 @@ class UsbGuardPromptRuntime {
     }
 
     _areDevicesTopologyRelated(deviceA, deviceB) {
-        const pathA = this._extractPortPath(deviceA.viaPort);
-        const pathB = this._extractPortPath(deviceB.viaPort);
-        if (this._isPathAncestorOrSame(pathA, pathB))
+        const portA = this._splitViaPort(deviceA.viaPort);
+        const portB = this._splitViaPort(deviceB.viaPort);
+        if (portA.path && portB.path) {
+            // Only compare topology paths directly when they are from the same
+            // host USB bus (or both lack explicit bus metadata).
+            const sameOrUnknownBus = (!portA.bus && !portB.bus) || (portA.bus && portA.bus === portB.bus);
+            if (sameOrUnknownBus && this._isPathAncestorOrSame(portA.path, portB.path))
+                return true;
+        }
+
+        if (deviceA.parentHash && deviceA.parentHash === deviceB.hash)
             return true;
 
-        if (deviceA.parentHash && (deviceA.parentHash === deviceB.hash || deviceA.parentHash === deviceB.parentHash))
-            return true;
-
-        if (deviceB.parentHash && (deviceB.parentHash === deviceA.hash || deviceB.parentHash === deviceA.parentHash))
+        if (deviceB.parentHash && deviceB.parentHash === deviceA.hash)
             return true;
 
         // Last-resort match for backends that omit both path and parent metadata.
+        const pathA = this._extractPortPath(deviceA.viaPort);
+        const pathB = this._extractPortPath(deviceB.viaPort);
         const hasExplicitTopology = Boolean((pathA && pathB) || deviceA.parentHash || deviceB.parentHash);
         if (deviceA.usbId && deviceA.usbId === deviceB.usbId && (deviceA.isHub || deviceB.isHub)) {
             if (hasExplicitTopology)
