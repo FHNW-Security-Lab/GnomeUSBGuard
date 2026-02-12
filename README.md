@@ -21,11 +21,10 @@ The action buttons map to `org.usbguard.Devices.applyDevicePolicy(...)`.
   flood you with many prompts.
 - Companion USB2/USB3 function devices from one physical plug event (for
   example hub + card reader functions) are grouped into one prompt burst.
-- Grouping is time-window based; later devices added to the same hub are
-  prompted again.
-- After you allow the initial hub burst, immediate follow-up devices on the
-  same physical port reuse that decision for a very short grace window to avoid
-  repeated prompts during late enumeration.
+- Grouping is topology-aware and time-window based: the extension merges devices
+  from the same short-lived physical insertion subtree (same or ancestor/child
+  `via-port` path, or parent relationship) into one prompt.
+- Later devices added to the same hub are prompted again as separate events.
 - Duplicate insert suppression is scoped to the same device and same port, so
   reinserting into a different port is prompted again.
 - While a prompt is still open, same-port companion events in a short merge
@@ -118,4 +117,3 @@ busctl --system call org.usbguard /org/usbguard org.usbguard.Devices listDevices
 ## License
 
 This project is licensed under GNU GPL v3.0 (`GPL-3.0-only`).
-

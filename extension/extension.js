@@ -24,9 +24,9 @@ const SCREENSAVER_INTERFACE = 'org.gnome.ScreenSaver';
 const SCREENSAVER_OBJECT_PATH = '/org/gnome/ScreenSaver';
 
 const INSERT_EVENT = 1;
-const HUB_PROMPT_DEBOUNCE_MS = 2200;
-const BURST_MAX_WINDOW_MS = 5500;
-const FOLLOWUP_DECISION_WINDOW_MS = 2500;
+const HUB_PROMPT_DEBOUNCE_MS = 4200;
+const DEVICE_PROMPT_DEBOUNCE_MS = 1200;
+const BURST_MAX_WINDOW_MS = 12000;
 const PENDING_DECISION_MERGE_WINDOW_MS = 4500;
 const DUPLICATE_INSERT_SUPPRESS_USEC = 900 * 1000;
 const DBUS_CALL_TIMEOUT_MS = 2500;
@@ -86,7 +86,6 @@ class UsbGuardPromptRuntime {
         this._pendingDecisionGroups = new Map();
         this._recentInsertions = new Map();
         this._pendingLockedDevices = new Map();
-        this._followupDecisions = new Map();
 
         try {
             this._bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, null);
@@ -139,7 +138,6 @@ class UsbGuardPromptRuntime {
         this._pendingDecisionGroups.clear();
         this._recentInsertions.clear();
         this._pendingLockedDevices.clear();
-        this._followupDecisions.clear();
 
         if (this._source) {
             this._source.destroy();
@@ -170,11 +168,6 @@ class UsbGuardPromptRuntime {
         const pendingDecision = this._findPendingDecisionContext(device, groupKey);
         if (pendingDecision) {
             pendingDecision.devicesByHash.set(device.hash, device);
-            return;
-        }
-
-        if (this._hasActiveFollowupDecision(groupKey)) {
-            void this._applyFollowupDecision(device, groupKey);
             return;
         }
 
@@ -347,27 +340,59 @@ class UsbGuardPromptRuntime {
         return match ? match[1] : viaPort;
     }
 
-    _extractCompanionRoot(viaPort) {
-        const portPath = this._extractPortPath(viaPort);
-        if (!portPath)
-            return '';
+    _isPathAncestorOrSame(pathA, pathB) {
+        if (!pathA || !pathB)
+            return false;
+        if (pathA === pathB)
+            return true;
 
-        // "1.4.2" -> "1"; "1" -> "1"
-        return portPath.split('.')[0];
+        return pathA.startsWith(`${pathB}.`) || pathB.startsWith(`${pathA}.`);
+    }
+
+    _areDevicesTopologyRelated(deviceA, deviceB) {
+        const pathA = this._extractPortPath(deviceA.viaPort);
+        const pathB = this._extractPortPath(deviceB.viaPort);
+        if (this._isPathAncestorOrSame(pathA, pathB))
+            return true;
+
+        if (deviceA.parentHash && (deviceA.parentHash === deviceB.hash || deviceA.parentHash === deviceB.parentHash))
+            return true;
+
+        if (deviceB.parentHash && (deviceB.parentHash === deviceA.hash || deviceB.parentHash === deviceA.parentHash))
+            return true;
+
+        // Some USB2/USB3 companion entries do not expose parent relationships.
+        if (deviceA.usbId && deviceA.usbId === deviceB.usbId && (deviceA.isHub || deviceB.isHub)) {
+            if (deviceA.serial && deviceB.serial)
+                return deviceA.serial === deviceB.serial;
+
+            return deviceA.name === deviceB.name;
+        }
+
+        return false;
+    }
+
+    _shouldMergeWithDevices(device, devicesByHash) {
+        for (const existing of devicesByHash.values()) {
+            if (this._areDevicesTopologyRelated(device, existing))
+                return true;
+        }
+
+        return false;
     }
 
     _groupKeyForDevice(device) {
-        // Group USB2/USB3 companion interfaces for the same physical insertion.
-        // Example: "3-1.x" and "4-1.x" both map to "companion-root:1".
-        const companionRoot = this._extractCompanionRoot(device.viaPort);
-        if (companionRoot)
-            return `companion-root:${companionRoot}`;
+        // Use full bus-independent topology path as primary key.
+        // Example: "3-1.4.2" and "4-1.4.2" both map to "port:1.4.2".
+        const portPath = this._extractPortPath(device.viaPort);
+        if (portPath)
+            return `port:${portPath}`;
 
         if (device.parentHash)
             return `parent:${device.parentHash}`;
 
-        if (device.isHub)
-            return `hub:${device.hash}`;
+        if (device.usbId)
+            return `usbid:${device.usbId}`;
 
         return `device:${device.hash}`;
     }
@@ -380,32 +405,7 @@ class UsbGuardPromptRuntime {
     }
 
     _shouldMergeIntoPendingContext(device, context) {
-        const existingDevices = [...context.devicesByHash.values()];
-        const companionRoot = this._extractCompanionRoot(device.viaPort);
-        if (companionRoot) {
-            for (const existing of existingDevices) {
-                if (this._extractCompanionRoot(existing.viaPort) === companionRoot)
-                    return true;
-            }
-        }
-
-        // Companion USB2/USB3 hubs for one physical dock may expose different
-        // bus/port roots. If they share hub identity and arrive nearly together,
-        // merge them into one pending decision.
-        if (!device.isHub || !device.usbId)
-            return false;
-
-        for (const existing of existingDevices) {
-            if (!existing.isHub || existing.usbId !== device.usbId)
-                continue;
-
-            if (device.serial && existing.serial)
-                return device.serial === existing.serial;
-
-            return device.name === existing.name;
-        }
-
-        return false;
+        return this._shouldMergeWithDevices(device, context.devicesByHash);
     }
 
     _findPendingDecisionContext(device, groupKey) {
@@ -429,6 +429,28 @@ class UsbGuardPromptRuntime {
         return null;
     }
 
+    _findPendingPromptGroup(device, preferredKey, nowUsec) {
+        const direct = this._pendingPromptGroups.get(preferredKey);
+        if (direct) {
+            if (nowUsec - direct.createdAtUsec <= BURST_MAX_WINDOW_MS * 1000)
+                return [preferredKey, direct];
+
+            this._flushGroup(preferredKey, direct);
+        }
+
+        for (const [key, group] of this._pendingPromptGroups.entries()) {
+            if (nowUsec - group.createdAtUsec > BURST_MAX_WINDOW_MS * 1000) {
+                this._flushGroup(key, group);
+                continue;
+            }
+
+            if (this._shouldMergeWithDevices(device, group.devicesByHash))
+                return [key, group];
+        }
+
+        return [preferredKey, null];
+    }
+
     _scheduleGroupTimer(groupKey, group) {
         if (group.timerId > 0)
             GLib.source_remove(group.timerId);
@@ -441,7 +463,8 @@ class UsbGuardPromptRuntime {
             return;
         }
 
-        const delayMs = Math.max(50, Math.min(HUB_PROMPT_DEBOUNCE_MS, remainingMs));
+        const debounceMs = group.hasHub ? HUB_PROMPT_DEBOUNCE_MS : DEVICE_PROMPT_DEBOUNCE_MS;
+        const delayMs = Math.max(50, Math.min(debounceMs, remainingMs));
         group.timerId = GLib.timeout_add(
             GLib.PRIORITY_DEFAULT,
             delayMs,
@@ -468,13 +491,9 @@ class UsbGuardPromptRuntime {
     }
 
     _queuePrompt(device, groupKey = null) {
-        const key = groupKey ?? this._groupKeyForDevice(device);
+        const preferredKey = groupKey ?? this._groupKeyForDevice(device);
         const now = GLib.get_monotonic_time();
-        let group = this._pendingPromptGroups.get(key);
-        if (group && now - group.createdAtUsec > BURST_MAX_WINDOW_MS * 1000) {
-            this._flushGroup(key, group);
-            group = null;
-        }
+        let [key, group] = this._findPendingPromptGroup(device, preferredKey, now);
 
         if (!group) {
             group = {
@@ -482,11 +501,13 @@ class UsbGuardPromptRuntime {
                 groupKey: key,
                 createdAtUsec: now,
                 devicesByHash: new Map(),
+                hasHub: false,
             };
             this._pendingPromptGroups.set(key, group);
         }
 
         group.devicesByHash.set(device.hash, device);
+        group.hasHub = group.hasHub || device.isHub;
         this._scheduleGroupTimer(key, group);
     }
 
@@ -548,7 +569,7 @@ class UsbGuardPromptRuntime {
         context.resolved = true;
         this._pendingDecisionGroups.delete(context.groupKey);
         const devices = [...context.devicesByHash.values()];
-        await this._applyDecision(devices, target, permanent, context.groupKey);
+        await this._applyDecision(devices, target, permanent);
     }
 
     async _handleInsertWhileLocked(device) {
@@ -562,43 +583,6 @@ class UsbGuardPromptRuntime {
                 'USBGuard lock-screen policy failed',
                 `Could not temporarily block ${device.name} while screen was locked.`
             );
-        }
-    }
-
-    _hasActiveFollowupDecision(groupKey) {
-        const decision = this._followupDecisions.get(groupKey);
-        if (!decision)
-            return false;
-
-        const now = GLib.get_monotonic_time();
-        if (decision.expiresAtUsec <= now) {
-            this._followupDecisions.delete(groupKey);
-            return false;
-        }
-
-        return true;
-    }
-
-    _rememberFollowupDecision(groupKey, target, permanent) {
-        const now = GLib.get_monotonic_time();
-        this._followupDecisions.set(groupKey, {
-            target,
-            permanent,
-            expiresAtUsec: now + FOLLOWUP_DECISION_WINDOW_MS * 1000,
-        });
-    }
-
-    async _applyFollowupDecision(device, groupKey) {
-        const decision = this._followupDecisions.get(groupKey);
-        if (!decision)
-            return;
-
-        try {
-            await this._applyDevicePolicy(device.id, decision.target, decision.permanent);
-        } catch (error) {
-            this._followupDecisions.delete(groupKey);
-            logException(error, `Failed to apply follow-up decision for ${device.name}`);
-            this._queuePrompt(device, groupKey);
         }
     }
 
@@ -626,7 +610,7 @@ class UsbGuardPromptRuntime {
         return `${preview}${suffix}\nChoose how these devices should be handled.`;
     }
 
-    async _applyDecision(devices, target, permanent, groupKey = null) {
+    async _applyDecision(devices, target, permanent) {
         const failures = [];
         for (const device of devices) {
             try {
@@ -638,8 +622,6 @@ class UsbGuardPromptRuntime {
         }
 
         if (failures.length === 0) {
-            if (groupKey && target === PolicyTarget.ALLOW)
-                this._rememberFollowupDecision(groupKey, target, permanent);
             return;
         }
 
@@ -707,4 +689,3 @@ export default class UsbGuardPromptEntryPoint extends Extension {
         this._impl = null;
     }
 }
-
