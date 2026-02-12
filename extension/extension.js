@@ -39,6 +39,7 @@ const POST_DECISION_ENUM_WINDOW_MS = 12000;
 const DUPLICATE_INSERT_SUPPRESS_USEC = 900 * 1000;
 const DBUS_CALL_TIMEOUT_MS = 2500;
 const SETTINGS_POLL_MS = 2000;
+const PERMANENT_RULE_CACHE_USEC = 3 * 1000 * 1000;
 const SETTINGS_FILENAME = 'settings.json';
 const SYSTEM_DEVICES_FILENAME = 'system-devices.json';
 
@@ -102,6 +103,9 @@ class UsbGuardPromptRuntime {
         this._suppressPromptsWhenTrayEnabled = false;
         this._traySettingsPollId = 0;
         this._trayButton = null;
+        this._permanentTargetByIdentity = new Map();
+        this._permanentRuleCacheUpdatedAtUsec = 0;
+        this._permanentRuleRefreshPromise = null;
 
         try {
             this._bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, null);
@@ -369,6 +373,41 @@ class UsbGuardPromptRuntime {
         return normalizedRule ? `rule:${normalizedRule}` : '';
     }
 
+    _buildRuleIdentityCandidates(identityCarrier) {
+        const candidates = [];
+        const add = key => {
+            if (!key || candidates.includes(key))
+                return;
+            candidates.push(key);
+        };
+
+        const hash = String(identityCarrier.hash ?? '').trim();
+        const serial = String(identityCarrier.serial ?? '').trim();
+        const usbId = String(identityCarrier.usbId ?? '').trim().toLowerCase();
+        const viaPort = String(identityCarrier.viaPort ?? '').trim();
+        const rule = String(identityCarrier.rule ?? '');
+
+        if (hash)
+            add(`hash:${hash}`);
+        if (serial && usbId)
+            add(`id-serial:${usbId}|${serial}`);
+        if (serial)
+            add(`serial:${serial}`);
+        if (usbId && viaPort)
+            add(`id-port:${usbId}|${viaPort}`);
+        if (usbId)
+            add(`usbid:${usbId}`);
+
+        const normalizedRule = rule
+            .replace(/^\s*(allow|block|reject)\b/i, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+        if (normalizedRule)
+            add(`rule:${normalizedRule}`);
+
+        return candidates;
+    }
+
     _normalizeTargetName(targetName) {
         const normalized = String(targetName ?? '').toLowerCase();
         if (normalized === 'reject')
@@ -378,15 +417,29 @@ class UsbGuardPromptRuntime {
         return 'unknown';
     }
 
-    _buildIdentityKeyFromRuleText(ruleText) {
-        const identityCarrier = {
+    _buildIdentityCandidatesFromRuleText(ruleText) {
+        return this._buildRuleIdentityCandidates({
             hash: this._extractRuleField(ruleText, 'hash'),
             serial: this._extractRuleField(ruleText, 'serial'),
             usbId: this._extractRuleUsbId(ruleText),
             viaPort: this._extractRuleField(ruleText, 'via-port'),
             rule: ruleText,
-        };
-        return this._buildRuleIdentityKey(identityCarrier);
+        });
+    }
+
+    _buildIdentityCandidatesFromDevice(device) {
+        return this._buildRuleIdentityCandidates({
+            hash: device.hash,
+            serial: device.serial,
+            usbId: device.usbId,
+            viaPort: device.viaPort,
+            rule: device.rule,
+        });
+    }
+
+    _invalidatePermanentRuleCache() {
+        this._permanentTargetByIdentity = new Map();
+        this._permanentRuleCacheUpdatedAtUsec = 0;
     }
 
     async _listPermanentRules() {
@@ -416,15 +469,60 @@ class UsbGuardPromptRuntime {
     _buildPermanentTargetByIdentity(rules) {
         const targets = new Map();
         for (const [_ruleId, ruleText] of rules) {
-            const key = this._buildIdentityKeyFromRuleText(ruleText);
-            if (!key)
-                continue;
             const target = this._normalizeTargetName(this._extractRuleTarget(ruleText));
             if (target === 'unknown')
                 continue;
-            targets.set(key, target);
+
+            const keys = this._buildIdentityCandidatesFromRuleText(ruleText);
+            for (const key of keys)
+                targets.set(key, target);
         }
         return targets;
+    }
+
+    async _getPermanentTargetByIdentityMap() {
+        const now = GLib.get_monotonic_time();
+        if (this._permanentRuleCacheUpdatedAtUsec > 0 &&
+            now - this._permanentRuleCacheUpdatedAtUsec < PERMANENT_RULE_CACHE_USEC) {
+            return this._permanentTargetByIdentity;
+        }
+
+        if (this._permanentRuleRefreshPromise)
+            return this._permanentRuleRefreshPromise;
+
+        this._permanentRuleRefreshPromise = (async () => {
+            const rules = await this._listPermanentRules();
+            const targets = this._buildPermanentTargetByIdentity(rules);
+            this._permanentTargetByIdentity = targets;
+            this._permanentRuleCacheUpdatedAtUsec = GLib.get_monotonic_time();
+            return targets;
+        })();
+
+        try {
+            return await this._permanentRuleRefreshPromise;
+        } finally {
+            this._permanentRuleRefreshPromise = null;
+        }
+    }
+
+    _getPermanentTargetForDeviceFromMap(device, permanentTargetByIdentity) {
+        const candidates = this._buildIdentityCandidatesFromDevice(device);
+        for (const key of candidates) {
+            const target = permanentTargetByIdentity.get(key);
+            if (target === 'allow' || target === 'block')
+                return target;
+        }
+        return null;
+    }
+
+    async _isCoveredByPermanentRule(device) {
+        try {
+            const map = await this._getPermanentTargetByIdentityMap();
+            return this._getPermanentTargetForDeviceFromMap(device, map) !== null;
+        } catch (error) {
+            logException(error, `Failed to evaluate permanent policy coverage for ${device.name}`);
+            return false;
+        }
     }
 
     async _listConnectedDevices() {
@@ -500,8 +598,7 @@ class UsbGuardPromptRuntime {
 
         const states = devices.map(device => {
             const currentTarget = this._normalizeTargetName(device.target);
-            const identity = this._buildRuleIdentityKey(device);
-            const permanentTarget = identity ? (permanentTargetByIdentity.get(identity) ?? null) : null;
+            const permanentTarget = this._getPermanentTargetForDeviceFromMap(device, permanentTargetByIdentity);
             return {
                 currentTarget,
                 permanentTarget,
@@ -579,8 +676,7 @@ class UsbGuardPromptRuntime {
 
         let permanentTargetByIdentity = new Map();
         try {
-            const rules = await this._listPermanentRules();
-            permanentTargetByIdentity = this._buildPermanentTargetByIdentity(rules);
+            permanentTargetByIdentity = await this._getPermanentTargetByIdentityMap();
         } catch (error) {
             logException(error, 'Failed to load permanent rules for tray status indicators');
         }
@@ -631,6 +727,13 @@ class UsbGuardPromptRuntime {
 
         const device = this._buildDeviceContext(id, deviceRule, attributes);
         if (this._shouldSuppressRepeatedInsert(device))
+            return;
+
+        void this._handleInsertedDevice(device);
+    }
+
+    async _handleInsertedDevice(device) {
+        if (await this._isCoveredByPermanentRule(device))
             return;
 
         if (this._screenLocked) {
@@ -1358,6 +1461,8 @@ class UsbGuardPromptRuntime {
         for (const objectPath of this._usbguardBackend.methodObjectPaths) {
             try {
                 await this._callUsbguardMethod(objectPath, 'applyDevicePolicy', args, replyType);
+                if (permanent)
+                    this._invalidatePermanentRuleCache();
                 return;
             } catch (error) {
                 lastError = error;
