@@ -620,8 +620,38 @@ export default class UsbGuardPromptPreferences extends ExtensionPreferences {
         }
 
         const updatedRuleText = rewriteRuleTarget(originalRuleText, newTarget);
-        await this._client.appendRule(updatedRuleText, 0);
-        await this._client.removeRule(ruleId);
+
+        // Prefer append-before-remove to avoid a temporary policy gap.
+        // Some USBGuard setups can reject this path due ordering/duplicate rules,
+        // so fall back to remove-then-append with rollback.
+        try {
+            const newRuleId = await this._client.appendRule(updatedRuleText, ruleId);
+            try {
+                await this._client.removeRule(ruleId);
+            } catch (error) {
+                // Best-effort rollback if old rule removal failed.
+                try {
+                    await this._client.removeRule(newRuleId);
+                } catch (_rollbackError) {
+                    // Ignore rollback failures and rethrow original error.
+                }
+                throw error;
+            }
+        } catch (appendFirstError) {
+            await this._client.removeRule(ruleId);
+            try {
+                await this._client.appendRule(updatedRuleText, 0);
+            } catch (appendAfterRemoveError) {
+                // Best-effort rollback to keep the original policy in place.
+                try {
+                    await this._client.appendRule(originalRuleText, 0);
+                } catch (_rollbackError) {
+                    // Ignore rollback failures and rethrow original error.
+                }
+                throw appendAfterRemoveError;
+            }
+        }
+
         this._setStatus(`Changed rule #${ruleId} target to ${newTarget}.`);
     }
 }
