@@ -28,6 +28,7 @@ const HUB_PROMPT_DEBOUNCE_MS = 4200;
 const DEVICE_PROMPT_DEBOUNCE_MS = 1200;
 const BURST_MAX_WINDOW_MS = 12000;
 const PENDING_DECISION_MERGE_WINDOW_MS = 4500;
+const POST_DECISION_ENUM_WINDOW_MS = 1800;
 const DUPLICATE_INSERT_SUPPRESS_USEC = 900 * 1000;
 const DBUS_CALL_TIMEOUT_MS = 2500;
 
@@ -84,6 +85,7 @@ class UsbGuardPromptRuntime {
         this._screenLocked = false;
         this._pendingPromptGroups = new Map();
         this._pendingDecisionGroups = new Map();
+        this._recentHubDecisions = new Map();
         this._recentInsertions = new Map();
         this._pendingLockedDevices = new Map();
 
@@ -136,6 +138,7 @@ class UsbGuardPromptRuntime {
         }
         this._pendingPromptGroups.clear();
         this._pendingDecisionGroups.clear();
+        this._recentHubDecisions.clear();
         this._recentInsertions.clear();
         this._pendingLockedDevices.clear();
 
@@ -165,6 +168,12 @@ class UsbGuardPromptRuntime {
         const pendingDecision = this._findPendingDecisionContext(device, groupKey);
         if (pendingDecision) {
             pendingDecision.devicesByHash.set(device.hash, device);
+            return;
+        }
+
+        const recentHubDecision = this._findRecentHubDecision(device);
+        if (recentHubDecision) {
+            void this._applyRecentHubDecision(device, groupKey, recentHubDecision);
             return;
         }
 
@@ -424,6 +433,29 @@ class UsbGuardPromptRuntime {
         return false;
     }
 
+    _isImmediateEnumerationChild(device, devicesByHash) {
+        if (devicesByHash.has(device.hash))
+            return true;
+
+        if (device.parentHash && devicesByHash.has(device.parentHash))
+            return true;
+
+        const devicePortPath = this._extractPortPath(device.viaPort);
+        if (!devicePortPath)
+            return false;
+
+        for (const existing of devicesByHash.values()) {
+            const existingPath = this._extractPortPath(existing.viaPort);
+            if (!existingPath)
+                continue;
+
+            if (devicePortPath === existingPath || devicePortPath.startsWith(`${existingPath}.`))
+                return true;
+        }
+
+        return false;
+    }
+
     _groupKeyForDevice(device) {
         // Use full bus-independent topology path as primary key.
         // Example: "3-1.4.2" and "4-1.4.2" both map to "port:1.4.2".
@@ -470,6 +502,57 @@ class UsbGuardPromptRuntime {
         }
 
         return null;
+    }
+
+    _pruneRecentHubDecisions(nowUsec = GLib.get_monotonic_time()) {
+        for (const [key, decision] of this._recentHubDecisions.entries()) {
+            if (decision.expiresAtUsec <= nowUsec)
+                this._recentHubDecisions.delete(key);
+        }
+    }
+
+    _findRecentHubDecision(device) {
+        const now = GLib.get_monotonic_time();
+        this._pruneRecentHubDecisions(now);
+
+        for (const [key, decision] of this._recentHubDecisions.entries()) {
+            if (!this._shouldMergeWithDevices(device, decision.devicesByHash))
+                continue;
+
+            if (!this._isImmediateEnumerationChild(device, decision.devicesByHash))
+                continue;
+
+            return [key, decision];
+        }
+
+        return null;
+    }
+
+    _rememberRecentHubDecision(context, target, permanent) {
+        const devices = [...context.devicesByHash.values()];
+        if (!devices.some(device => device.isHub))
+            return;
+
+        const now = GLib.get_monotonic_time();
+        this._pruneRecentHubDecisions(now);
+        this._recentHubDecisions.set(`${context.groupKey}|${now}`, {
+            target,
+            permanent,
+            expiresAtUsec: now + POST_DECISION_ENUM_WINDOW_MS * 1000,
+            devicesByHash: new Map(context.devicesByHash),
+        });
+    }
+
+    async _applyRecentHubDecision(device, groupKey, recentHubDecision) {
+        const [decisionKey, decision] = recentHubDecision;
+        try {
+            await this._applyDevicePolicy(device.id, decision.target, decision.permanent);
+            decision.devicesByHash.set(device.hash, device);
+        } catch (error) {
+            this._recentHubDecisions.delete(decisionKey);
+            logException(error, `Failed to auto-apply recent hub decision for ${device.name}`);
+            this._queuePrompt(device, groupKey);
+        }
     }
 
     _findPendingPromptGroup(device, preferredKey, nowUsec) {
@@ -637,7 +720,9 @@ class UsbGuardPromptRuntime {
         context.resolved = true;
         this._pendingDecisionGroups.delete(context.groupKey);
         const devices = [...context.devicesByHash.values()];
-        await this._applyDecision(devices, target, permanent);
+        const ok = await this._applyDecision(devices, target, permanent);
+        if (ok)
+            this._rememberRecentHubDecision(context, target, permanent);
     }
 
     async _handleInsertWhileLocked(device) {
@@ -690,13 +775,14 @@ class UsbGuardPromptRuntime {
         }
 
         if (failures.length === 0) {
-            return;
+            return true;
         }
 
         Main.notifyError(
             'USBGuard policy update failed',
             `Could not update: ${failures.join(', ')}`
         );
+        return false;
     }
 
     async _applyDevicePolicy(deviceId, target, permanent) {
