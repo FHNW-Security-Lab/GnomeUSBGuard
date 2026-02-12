@@ -28,6 +28,8 @@ The action buttons map to `org.usbguard.Devices.applyDevicePolicy(...)`.
   repeated prompts during late enumeration.
 - Duplicate insert suppression is scoped to the same device and same port, so
   reinserting into a different port is prompted again.
+- While a prompt is still open, same-port companion events in a short merge
+  window are folded into that prompt instead of creating a second one.
 - Devices connected through the hub later are prompted again as separate
   devices.
 - If the screen is locked, newly inserted devices are immediately **blocked once**

@@ -27,6 +27,7 @@ const INSERT_EVENT = 1;
 const HUB_PROMPT_DEBOUNCE_MS = 2200;
 const BURST_MAX_WINDOW_MS = 5500;
 const FOLLOWUP_DECISION_WINDOW_MS = 2500;
+const PENDING_DECISION_MERGE_WINDOW_MS = 4500;
 const DUPLICATE_INSERT_SUPPRESS_USEC = 900 * 1000;
 const DBUS_CALL_TIMEOUT_MS = 2500;
 
@@ -166,7 +167,7 @@ class UsbGuardPromptRuntime {
         }
 
         const groupKey = this._groupKeyForDevice(device);
-        const pendingDecision = this._pendingDecisionGroups.get(groupKey);
+        const pendingDecision = this._findPendingDecisionContext(device, groupKey);
         if (pendingDecision) {
             pendingDecision.devicesByHash.set(device.hash, device);
             return;
@@ -289,12 +290,16 @@ class UsbGuardPromptRuntime {
         const parentHash = attrs['parent-hash']?.trim() || '';
         const interfaceDescriptor = attrs['with-interface']?.trim() || '';
         const viaPort = attrs['via-port']?.trim() || '';
+        const usbId = attrs.id?.trim() || '';
+        const serial = attrs.serial?.trim() || '';
 
         return {
             id,
             hash,
             parentHash,
             viaPort,
+            usbId,
+            serial,
             name: deviceName,
             rule: deviceRule,
             isHub: this._looksLikeUsbHub(deviceName, interfaceDescriptor, deviceRule),
@@ -365,6 +370,63 @@ class UsbGuardPromptRuntime {
             return `hub:${device.hash}`;
 
         return `device:${device.hash}`;
+    }
+
+    _isPendingDecisionContextActive(context, nowUsec) {
+        if (!context || context.resolved)
+            return false;
+
+        return nowUsec - context.createdAtUsec <= PENDING_DECISION_MERGE_WINDOW_MS * 1000;
+    }
+
+    _shouldMergeIntoPendingContext(device, context) {
+        const existingDevices = [...context.devicesByHash.values()];
+        const companionRoot = this._extractCompanionRoot(device.viaPort);
+        if (companionRoot) {
+            for (const existing of existingDevices) {
+                if (this._extractCompanionRoot(existing.viaPort) === companionRoot)
+                    return true;
+            }
+        }
+
+        // Companion USB2/USB3 hubs for one physical dock may expose different
+        // bus/port roots. If they share hub identity and arrive nearly together,
+        // merge them into one pending decision.
+        if (!device.isHub || !device.usbId)
+            return false;
+
+        for (const existing of existingDevices) {
+            if (!existing.isHub || existing.usbId !== device.usbId)
+                continue;
+
+            if (device.serial && existing.serial)
+                return device.serial === existing.serial;
+
+            return device.name === existing.name;
+        }
+
+        return false;
+    }
+
+    _findPendingDecisionContext(device, groupKey) {
+        const now = GLib.get_monotonic_time();
+        const direct = this._pendingDecisionGroups.get(groupKey);
+        if (this._isPendingDecisionContextActive(direct, now))
+            return direct;
+        if (direct)
+            this._pendingDecisionGroups.delete(groupKey);
+
+        for (const [key, context] of this._pendingDecisionGroups.entries()) {
+            if (!this._isPendingDecisionContextActive(context, now)) {
+                this._pendingDecisionGroups.delete(key);
+                continue;
+            }
+
+            if (this._shouldMergeIntoPendingContext(device, context))
+                return context;
+        }
+
+        return null;
     }
 
     _scheduleGroupTimer(groupKey, group) {
@@ -445,6 +507,7 @@ class UsbGuardPromptRuntime {
         const decisionContext = {
             groupKey: group.groupKey,
             devicesByHash: new Map(group.devicesByHash),
+            createdAtUsec: GLib.get_monotonic_time(),
             resolved: false,
         };
         this._pendingDecisionGroups.set(group.groupKey, decisionContext);
