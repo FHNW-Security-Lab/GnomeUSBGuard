@@ -574,32 +574,24 @@ export default class UsbGuardPromptPreferences extends ExtensionPreferences {
                 row.set_title_lines(1);
             row.set_tooltip_text(parsed.rawText);
 
-            const actions = [
-                {
-                    label: 'Set Allow',
-                    run: async () => {
-                        await this._changeRuleTarget(ruleId, ruleText, 'allow');
-                    },
-                },
-                {
-                    label: 'Set Block',
-                    run: async () => {
-                        await this._changeRuleTarget(ruleId, ruleText, 'block');
-                    },
-                },
-                {
-                    label: 'Set Reject',
-                    run: async () => {
-                        await this._changeRuleTarget(ruleId, ruleText, 'reject');
-                    },
-                },
-            ];
+            const nextTarget = parsed.target === 'allow' ? 'block' : 'allow';
+            const toggleLabel = nextTarget === 'block' ? 'Set Block' : 'Set Allow';
             const controls = new Gtk.Box({
                 orientation: Gtk.Orientation.HORIZONTAL,
                 spacing: 6,
                 valign: Gtk.Align.CENTER,
             });
-            controls.append(this._createChangeMenuButton(actions));
+            const toggleButton = this._registerActionButton(new Gtk.Button({
+                label: toggleLabel,
+                valign: Gtk.Align.CENTER,
+            }));
+            toggleButton.connect('clicked', () => {
+                void this._runBusyTask(async () => {
+                    await this._changeRuleTarget(ruleId, ruleText, nextTarget);
+                    await this._refreshAll();
+                });
+            });
+            controls.append(toggleButton);
             const removeButton = this._registerActionButton(new Gtk.Button({
                 label: 'Remove',
                 valign: Gtk.Align.CENTER,
