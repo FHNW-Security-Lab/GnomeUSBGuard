@@ -376,8 +376,8 @@ export default class UsbGuardPromptPreferences extends ExtensionPreferences {
 
         page.add(controlsGroup);
         page.add(this._devicesGroup);
-        page.add(this._systemRulesGroup);
         page.add(this._rulesGroup);
+        page.add(this._systemRulesGroup);
         page.add(this._baselineGroup);
         window.add(page);
 
