@@ -25,6 +25,7 @@ const SCREENSAVER_OBJECT_PATH = '/org/gnome/ScreenSaver';
 
 const INSERT_EVENT = 1;
 const HUB_PROMPT_DEBOUNCE_MS = 2200;
+const BURST_MAX_WINDOW_MS = 5500;
 const REPEAT_INSERT_SUPPRESS_USEC = 3 * 1000 * 1000;
 const DBUS_CALL_TIMEOUT_MS = 2500;
 
@@ -352,24 +353,53 @@ class UsbGuardPromptRuntime {
         if (group.timerId > 0)
             GLib.source_remove(group.timerId);
 
+        const now = GLib.get_monotonic_time();
+        const elapsedMs = Math.floor((now - group.createdAtUsec) / 1000);
+        const remainingMs = BURST_MAX_WINDOW_MS - elapsedMs;
+        if (remainingMs <= 0) {
+            this._flushGroup(groupKey, group);
+            return;
+        }
+
+        const delayMs = Math.max(50, Math.min(HUB_PROMPT_DEBOUNCE_MS, remainingMs));
         group.timerId = GLib.timeout_add(
             GLib.PRIORITY_DEFAULT,
-            HUB_PROMPT_DEBOUNCE_MS,
+            delayMs,
             () => {
-                this._pendingPromptGroups.delete(groupKey);
                 group.timerId = 0;
-                this._showPromptForGroup(group);
+                this._flushGroup(groupKey, group, false);
                 return GLib.SOURCE_REMOVE;
             }
         );
     }
 
+    _flushGroup(groupKey, group, removeTimer = true) {
+        const current = this._pendingPromptGroups.get(groupKey);
+        if (current !== group)
+            return;
+
+        this._pendingPromptGroups.delete(groupKey);
+        if (removeTimer && group.timerId > 0) {
+            GLib.source_remove(group.timerId);
+            group.timerId = 0;
+        }
+
+        this._showPromptForGroup(group);
+    }
+
     _queuePrompt(device) {
         const groupKey = this._groupKeyForDevice(device);
+        const now = GLib.get_monotonic_time();
         let group = this._pendingPromptGroups.get(groupKey);
+        if (group && now - group.createdAtUsec > BURST_MAX_WINDOW_MS * 1000) {
+            this._flushGroup(groupKey, group);
+            group = null;
+        }
+
         if (!group) {
             group = {
                 timerId: 0,
+                createdAtUsec: now,
                 devicesByHash: new Map(),
             };
             this._pendingPromptGroups.set(groupKey, group);

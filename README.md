@@ -21,6 +21,8 @@ The action buttons map to `org.usbguard.Devices.applyDevicePolicy(...)`.
   flood you with many prompts.
 - Companion USB2/USB3 function devices from one physical plug event (for
   example hub + card reader functions) are grouped into one prompt burst.
+- Grouping is time-window based; later devices added to the same hub are
+  prompted again.
 - Devices connected through the hub later are prompted again as separate
   devices.
 - If the screen is locked, newly inserted devices are immediately **blocked once**
