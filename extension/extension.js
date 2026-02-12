@@ -480,6 +480,38 @@ class UsbGuardPromptRuntime {
         return targets;
     }
 
+    _buildPermanentRuleIdsByIdentity(rules) {
+        const idsByIdentity = new Map();
+        for (const [ruleId, ruleText] of rules) {
+            const target = this._normalizeTargetName(this._extractRuleTarget(ruleText));
+            if (target === 'unknown')
+                continue;
+
+            const keys = this._buildIdentityCandidatesFromRuleText(ruleText);
+            for (const key of keys) {
+                if (!idsByIdentity.has(key))
+                    idsByIdentity.set(key, new Set());
+                idsByIdentity.get(key).add(ruleId);
+            }
+        }
+        return idsByIdentity;
+    }
+
+    _collectPermanentRuleIdsForDevices(devices, idsByIdentity) {
+        const ruleIds = new Set();
+        for (const device of devices) {
+            const keys = this._buildIdentityCandidatesFromDevice(device);
+            for (const key of keys) {
+                const ids = idsByIdentity.get(key);
+                if (!ids)
+                    continue;
+                for (const ruleId of ids)
+                    ruleIds.add(ruleId);
+            }
+        }
+        return [...ruleIds];
+    }
+
     async _getPermanentTargetByIdentityMap() {
         const now = GLib.get_monotonic_time();
         if (this._permanentRuleCacheUpdatedAtUsec > 0 &&
@@ -523,6 +555,64 @@ class UsbGuardPromptRuntime {
             logException(error, `Failed to evaluate permanent policy coverage for ${device.name}`);
             return false;
         }
+    }
+
+    async _removePolicyRule(ruleId) {
+        const args = new GLib.Variant('(u)', [ruleId]);
+        let lastError = null;
+
+        for (const objectPath of this._usbguardBackend.policyObjectPaths) {
+            try {
+                await this._callUsbguardMethod(
+                    objectPath,
+                    'removeRule',
+                    args,
+                    null,
+                    this._usbguardBackend.policyInterface
+                );
+                return;
+            } catch (error) {
+                lastError = error;
+            }
+        }
+
+        throw lastError ?? new Error(`USBGuard removeRule failed for rule ${ruleId}`);
+    }
+
+    async _removePermanentRulesForDevices(devices) {
+        let rules;
+        try {
+            rules = await this._listPermanentRules();
+        } catch (error) {
+            logException(error, 'Failed to list permanent rules before temporary tray action');
+            return false;
+        }
+
+        const idsByIdentity = this._buildPermanentRuleIdsByIdentity(rules);
+        const ruleIds = this._collectPermanentRuleIdsForDevices(devices, idsByIdentity);
+        if (ruleIds.length === 0)
+            return true;
+
+        const failedRuleIds = [];
+        for (const ruleId of ruleIds) {
+            try {
+                await this._removePolicyRule(ruleId);
+            } catch (error) {
+                failedRuleIds.push(ruleId);
+                logException(error, `Failed to remove permanent rule #${ruleId} for temporary tray action`);
+            }
+        }
+
+        if (failedRuleIds.length > 0) {
+            Main.notifyError(
+                'USBGuard tray action failed',
+                `Could not remove permanent rule(s): ${failedRuleIds.join(', ')}`
+            );
+            return false;
+        }
+
+        this._invalidatePermanentRuleCache();
+        return true;
     }
 
     async _listConnectedDevices() {
@@ -629,6 +719,12 @@ class UsbGuardPromptRuntime {
     }
 
     async _applyPolicyToDeviceGroup(devices, target, permanent) {
+        if (!permanent) {
+            const removed = await this._removePermanentRulesForDevices(devices);
+            if (!removed)
+                return;
+        }
+
         const failures = [];
         for (const device of devices) {
             try {
