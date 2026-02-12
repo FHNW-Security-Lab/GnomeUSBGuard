@@ -29,6 +29,7 @@ const TARGET_NAME_TO_NUMERIC = {
     block: 1,
     reject: 2,
 };
+const SYSTEM_DEVICES_FILENAME = 'system-devices.json';
 
 function escapeRegex(value) {
     return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -236,8 +237,10 @@ export default class UsbGuardPromptPreferences extends ExtensionPreferences {
         this._window = window;
         this._actionWidgets = [];
         this._deviceRows = [];
+        this._systemRuleRows = [];
         this._ruleRows = [];
         this._busy = false;
+        this._systemDeviceKeys = new Set();
 
         window.set_default_size(1100, 760);
         window.set_search_enabled(true);
@@ -300,14 +303,42 @@ export default class UsbGuardPromptPreferences extends ExtensionPreferences {
             description: 'Active devices without permanent rules. Shows current status and lets you change state.',
         });
 
+        this._systemRulesGroup = new Adw.PreferencesGroup({
+            title: 'System-Devices',
+            description: 'Baseline trusted devices (permanent rules) with allow/block toggle and remove.',
+        });
+
         this._rulesGroup = new Adw.PreferencesGroup({
             title: 'Permanent Rules',
             description: 'Devices/rules persisted in USBGuard policy with current status, change, and remove actions.',
         });
 
+        this._baselineGroup = new Adw.PreferencesGroup({
+            title: 'Baseline',
+            description: 'Set all currently connected devices as allowed System-Devices.',
+        });
+        const baselineRow = new Adw.ActionRow({
+            title: 'Set baseline from connected devices',
+            subtitle: 'Creates/updates permanent allow policy and marks devices as System-Devices.',
+        });
+        this._setBaselineButton = this._registerActionButton(new Gtk.Button({
+            label: 'Set Baseline',
+            valign: Gtk.Align.CENTER,
+        }));
+        this._setBaselineButton.connect('clicked', () => {
+            void this._runBusyTask(async () => {
+                await this._setBaselineFromConnectedDevices();
+                await this._refreshAll();
+            });
+        });
+        baselineRow.add_suffix(this._setBaselineButton);
+        this._baselineGroup.add(baselineRow);
+
         page.add(controlsGroup);
         page.add(this._devicesGroup);
+        page.add(this._systemRulesGroup);
         page.add(this._rulesGroup);
+        page.add(this._baselineGroup);
         window.add(page);
 
         void this._runBusyTask(async () => {
@@ -401,11 +432,111 @@ export default class UsbGuardPromptPreferences extends ExtensionPreferences {
             this._statusRow.set_subtitle(message);
     }
 
+    _systemDevicesPath() {
+        return GLib.build_filenamev([
+            GLib.get_user_config_dir(),
+            'usbguard-prompt',
+            SYSTEM_DEVICES_FILENAME,
+        ]);
+    }
+
+    _loadSystemDeviceKeys() {
+        const path = this._systemDevicesPath();
+        try {
+            if (!GLib.file_test(path, GLib.FileTest.EXISTS))
+                return new Set();
+
+            const [ok, contents] = GLib.file_get_contents(path);
+            if (!ok)
+                return new Set();
+
+            const text = new TextDecoder().decode(contents);
+            const parsed = JSON.parse(text);
+            if (!Array.isArray(parsed))
+                return new Set();
+
+            return new Set(parsed.filter(key => typeof key === 'string' && key.length > 0));
+        } catch (error) {
+            logError(error, '[usbguard-prompt] Failed to load System-Devices metadata');
+            return new Set();
+        }
+    }
+
+    _saveSystemDeviceKeys() {
+        const path = this._systemDevicesPath();
+        const dir = GLib.path_get_dirname(path);
+        try {
+            GLib.mkdir_with_parents(dir, 0o700);
+            const payload = JSON.stringify([...this._systemDeviceKeys].sort(), null, 2);
+            GLib.file_set_contents(path, payload);
+        } catch (error) {
+            logError(error, '[usbguard-prompt] Failed to persist System-Devices metadata');
+            throw error;
+        }
+    }
+
+    _buildDeviceIdentityKey(parsedRule) {
+        if (parsedRule.hash)
+            return `hash:${parsedRule.hash}`;
+        if (parsedRule.serial && parsedRule.usbId)
+            return `id-serial:${parsedRule.usbId}|${parsedRule.serial}`;
+        if (parsedRule.serial)
+            return `serial:${parsedRule.serial}`;
+        if (parsedRule.usbId && parsedRule.viaPort)
+            return `id-port:${parsedRule.usbId}|${parsedRule.viaPort}`;
+        if (parsedRule.usbId)
+            return `usbid:${parsedRule.usbId}`;
+
+        const normalizedRule = String(parsedRule.rawText ?? '')
+            .replace(/^\s*(allow|block|reject)\b/i, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+        if (normalizedRule)
+            return `rule:${normalizedRule}`;
+
+        return null;
+    }
+
+    async _setBaselineFromConnectedDevices() {
+        const devices = await this._client.listDevices();
+        if (devices.length === 0) {
+            this._setStatus('No connected devices available for baseline.');
+            return;
+        }
+
+        this._systemDeviceKeys = this._loadSystemDeviceKeys();
+        let changedKeys = 0;
+        let withoutKey = 0;
+
+        for (const [deviceId, deviceRule] of devices) {
+            const parsed = parseRuleText(deviceRule);
+            await this._client.applyDevicePolicy(deviceId, 'allow', true);
+
+            const identity = this._buildDeviceIdentityKey(parsed);
+            if (!identity) {
+                withoutKey++;
+                continue;
+            }
+
+            if (!this._systemDeviceKeys.has(identity)) {
+                this._systemDeviceKeys.add(identity);
+                changedKeys++;
+            }
+        }
+
+        this._saveSystemDeviceKeys();
+        const total = devices.length;
+        const suffix = withoutKey > 0 ? ` (${withoutKey} without stable identity key)` : '';
+        this._setStatus(`Baseline applied for ${total} connected device(s); added ${changedKeys} System-Device key(s).${suffix}`);
+    }
+
     async _refreshAll() {
         const [devices, rules] = await Promise.all([
             this._client.listDevices(),
             this._client.listRules(),
         ]);
+
+        this._systemDeviceKeys = this._loadSystemDeviceKeys();
 
         const parsedDevices = devices.map(([deviceId, deviceRule]) => ({
             deviceId,
@@ -425,15 +556,28 @@ export default class UsbGuardPromptPreferences extends ExtensionPreferences {
             }
         }
 
+        const systemRules = [];
+        const permanentRules = [];
+        for (const [ruleId, ruleText] of rules) {
+            const parsedRule = parseRuleText(ruleText);
+            const identity = this._buildDeviceIdentityKey(parsedRule);
+            if (identity && this._systemDeviceKeys.has(identity)) {
+                systemRules.push([ruleId, ruleText]);
+            } else {
+                permanentRules.push([ruleId, ruleText]);
+            }
+        }
+
         this._renderDevices(parsedDevices, permanentRuleMatchesByDeviceId);
-        this._renderRules(rules, connectedDevicesByRuleId);
+        this._renderSystemRules(systemRules, connectedDevicesByRuleId);
+        this._renderRules(permanentRules, connectedDevicesByRuleId);
 
         const transientCount = parsedDevices.filter(device => {
             const matches = permanentRuleMatchesByDeviceId.get(device.deviceId) ?? [];
             return matches.length === 0;
         }).length;
         this._setStatus(
-            `Loaded ${parsedDevices.length} connected devices (${transientCount} without permanent rule) and ${rules.length} permanent rules.`
+            `Loaded ${parsedDevices.length} connected devices (${transientCount} without permanent rule), ${systemRules.length} System-Devices, ${permanentRules.length} permanent rules.`
         );
     }
 
@@ -448,7 +592,7 @@ export default class UsbGuardPromptPreferences extends ExtensionPreferences {
         if (visibleDevices.length === 0) {
             const emptyRow = new Adw.ActionRow({
                 title: 'No non-permanent connected devices',
-                subtitle: 'Devices with permanent rules are listed under "Permanent Rules".',
+                subtitle: 'Devices with permanent rules are listed under "System-Devices" or "Permanent Rules".',
             });
             emptyRow.activatable = false;
             this._devicesGroup.add(emptyRow);
@@ -534,22 +678,45 @@ export default class UsbGuardPromptPreferences extends ExtensionPreferences {
         return [];
     }
 
+    _renderSystemRules(rules, connectedDevicesByRuleId) {
+        this._renderRuleRows(
+            this._systemRulesGroup,
+            this._systemRuleRows,
+            rules,
+            connectedDevicesByRuleId,
+            'No System-Devices',
+            'Use "Set Baseline" at the bottom to populate this category.'
+        );
+    }
+
     _renderRules(rules, connectedDevicesByRuleId) {
-        this._clearGroupRows(this._rulesGroup, this._ruleRows);
+        this._renderRuleRows(
+            this._rulesGroup,
+            this._ruleRows,
+            rules,
+            connectedDevicesByRuleId,
+            'No permanent rules',
+            'Create rules via prompts or device actions.'
+        );
+    }
+
+    _renderRuleRows(group, rowsList, rules, connectedDevicesByRuleId, emptyTitle, emptySubtitle) {
+        this._clearGroupRows(group, rowsList);
 
         if (rules.length === 0) {
             const emptyRow = new Adw.ActionRow({
-                title: 'No permanent rules',
-                subtitle: 'Create rules via prompts or device actions.',
+                title: emptyTitle,
+                subtitle: emptySubtitle,
             });
             emptyRow.activatable = false;
-            this._rulesGroup.add(emptyRow);
-            this._ruleRows.push(emptyRow);
+            group.add(emptyRow);
+            rowsList.push(emptyRow);
             return;
         }
 
         for (const [ruleId, ruleText] of rules) {
             const parsed = parseRuleText(ruleText);
+            const identity = this._buildDeviceIdentityKey(parsed);
             const title = parsed.name || parsed.hash || parsed.usbId || `Rule ${ruleId}`;
             const connectedDevices = connectedDevicesByRuleId.get(ruleId) ?? [];
             const connectedStatuses = [...new Set(connectedDevices.map(device => device.parsed.target))];
@@ -599,6 +766,10 @@ export default class UsbGuardPromptPreferences extends ExtensionPreferences {
             removeButton.connect('clicked', () => {
                 void this._runBusyTask(async () => {
                     await this._client.removeRule(ruleId);
+                    if (identity && this._systemDeviceKeys.has(identity)) {
+                        this._systemDeviceKeys.delete(identity);
+                        this._saveSystemDeviceKeys();
+                    }
                     this._setStatus(`Removed permanent rule #${ruleId}.`);
                     await this._refreshAll();
                 });
@@ -607,8 +778,8 @@ export default class UsbGuardPromptPreferences extends ExtensionPreferences {
 
             row.add_suffix(controls);
 
-            this._rulesGroup.add(row);
-            this._ruleRows.push(row);
+            group.add(row);
+            rowsList.push(row);
         }
     }
 
