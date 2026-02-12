@@ -171,7 +171,7 @@ class UsbGuardPromptRuntime {
             return;
         }
 
-        const recentHubDecision = device.isHub ? this._findRecentHubDecision(device) : null;
+        const recentHubDecision = this._findRecentHubDecision(device);
         if (recentHubDecision) {
             void this._applyRecentHubDecision(device, groupKey, recentHubDecision);
             return;
@@ -345,6 +345,7 @@ class UsbGuardPromptRuntime {
             viaPort,
             usbId,
             serial,
+            interfaceDescriptor,
             name: deviceName,
             rule: deviceRule,
             isHub: this._looksLikeUsbHub(deviceName, interfaceDescriptor, deviceRule),
@@ -366,6 +367,41 @@ class UsbGuardPromptRuntime {
 
         // USB class 09 is hub. The "with-interface" value may include 09:*:*.
         return /(^|[^0-9a-f])09:[0-9a-f]{2}:[0-9a-f]{2}([^0-9a-f]|$)/.test(haystack);
+    }
+
+    _extractInterfaceClasses(device) {
+        const classes = new Set();
+        const haystack = `${device.interfaceDescriptor || ''} ${device.rule || ''}`.toLowerCase();
+        const matches = haystack.match(/[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}/g) ?? [];
+        for (const match of matches)
+            classes.add(match.slice(0, 2));
+        return classes;
+    }
+
+    _looksLikeDockInfrastructureDevice(device) {
+        if (device.isHub)
+            return true;
+
+        const name = String(device.name ?? '').toLowerCase();
+        if (name.includes('card reader') || name.includes('billboard'))
+            return true;
+
+        const interfaceClasses = this._extractInterfaceClasses(device);
+        if (interfaceClasses.has('09') || interfaceClasses.has('11'))
+            return true;
+
+        if (interfaceClasses.has('08') && name.includes('card reader'))
+            return true;
+
+        return false;
+    }
+
+    _isMergeEligiblePair(deviceA, deviceB) {
+        if (deviceA.hash === deviceB.hash)
+            return true;
+
+        return this._looksLikeDockInfrastructureDevice(deviceA) &&
+            this._looksLikeDockInfrastructureDevice(deviceB);
     }
 
     _shouldSuppressRepeatedInsert(device) {
@@ -461,7 +497,7 @@ class UsbGuardPromptRuntime {
 
     _shouldMergeWithDevices(device, devicesByHash) {
         for (const existing of devicesByHash.values()) {
-            if (this._areDevicesTopologyRelated(device, existing))
+            if (this._areDevicesTopologyRelated(device, existing) && this._isMergeEligiblePair(device, existing))
                 return true;
         }
 
