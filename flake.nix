@@ -15,6 +15,22 @@
 
         extensionUuid = "usbguard-prompt@blacksheeep";
         gnomeShellVersion = "49";
+        releaseZipTool = pkgs.writeShellApplication {
+          name = "usbguard-release-zip";
+          runtimeInputs = with pkgs; [
+            coreutils
+            findutils
+            gnome-extensions-cli
+            gnugrep
+            jq
+            zip
+          ];
+          text = ''
+            set -euo pipefail
+            repo_root="''${1:-$PWD}"
+            exec ${pkgs.bash}/bin/bash ${./scripts/release-zip.sh} "$repo_root"
+          '';
+        };
       in
       {
         packages.default = pkgs.stdenvNoCC.mkDerivation {
@@ -61,6 +77,11 @@
           '');
         };
 
+        apps.release-zip = {
+          type = "app";
+          program = "${releaseZipTool}/bin/usbguard-release-zip";
+        };
+
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
             gjs
@@ -69,6 +90,7 @@
             libadwaita
             gnome-shell
             gnome-extensions-cli
+            jq
             usbguard
           ];
         };
@@ -76,4 +98,3 @@
         formatter = pkgs.nixfmt-rfc-style;
       });
 }
-

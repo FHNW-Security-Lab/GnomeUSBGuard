@@ -50,6 +50,21 @@ Build package:
 nix build "path:$PWD#default"
 ```
 
+Build a clean extension release zip (dependency-resolved via Nix, output in `build/`):
+
+```bash
+nix run "path:$PWD#release-zip"
+```
+
+This command:
+
+- resolves required tools through Nix (`gnome-extensions`, `jq`, `zip`, etc.)
+- builds a release zip in `build/` named `<uuid>-v<metadata.version>.zip`
+- removes older zip files for the same extension UUID in `build/`
+- uses temporary directories and cleans them on exit (no leftover temp artifacts)
+
+For local development/install, existing flake targets are unchanged (`#default`, `#install`).
+
 Enter development shell:
 
 ```bash

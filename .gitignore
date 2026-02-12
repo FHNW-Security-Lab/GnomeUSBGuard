@@ -1,7 +1,7 @@
 result
 result-*
+build/
 .direnv
 *.swp
 *.swo
 *.log
-
