@@ -14,12 +14,16 @@ const USBGUARD_BACKENDS = [
         devicesInterface: 'org.usbguard.Devices1',
         signalObjectPath: '/org/usbguard1/Devices',
         methodObjectPaths: ['/org/usbguard1/Devices'],
+        policyInterface: 'org.usbguard.Policy1',
+        policyObjectPaths: ['/org/usbguard1/Policy'],
     },
     {
         busName: 'org.usbguard',
         devicesInterface: 'org.usbguard.Devices',
         signalObjectPath: '/org/usbguard/Devices',
         methodObjectPaths: ['/org/usbguard', '/org/usbguard/Devices'],
+        policyInterface: 'org.usbguard.Policy',
+        policyObjectPaths: ['/org/usbguard/Devices', '/org/usbguard'],
     },
 ];
 const SCREENSAVER_BUS_NAME = 'org.gnome.ScreenSaver';
@@ -95,6 +99,7 @@ class UsbGuardPromptRuntime {
         this._recentInsertions = new Map();
         this._pendingLockedDevices = new Map();
         this._trayEnabled = false;
+        this._suppressPromptsWhenTrayEnabled = false;
         this._traySettingsPollId = 0;
         this._trayButton = null;
 
@@ -204,16 +209,36 @@ class UsbGuardPromptRuntime {
     _readTraySettings() {
         const data = this._readJsonFile(this._settingsPath());
         if (!data || typeof data !== 'object')
-            return {trayIconEnabled: false};
+            return {
+                trayIconEnabled: false,
+                disableNotificationsWhenTrayEnabled: false,
+            };
 
         return {
             trayIconEnabled: Boolean(data.trayIconEnabled),
+            disableNotificationsWhenTrayEnabled: Boolean(data.disableNotificationsWhenTrayEnabled),
         };
     }
 
     _reloadTraySettings() {
         const settings = this._readTraySettings();
         this._trayEnabled = Boolean(settings.trayIconEnabled);
+        this._suppressPromptsWhenTrayEnabled = Boolean(settings.disableNotificationsWhenTrayEnabled);
+    }
+
+    _shouldSuppressPrompts() {
+        return this._trayEnabled && this._suppressPromptsWhenTrayEnabled;
+    }
+
+    _clearPendingPromptState() {
+        for (const group of this._pendingPromptGroups.values()) {
+            if (group.timerId > 0)
+                GLib.source_remove(group.timerId);
+        }
+
+        this._pendingPromptGroups.clear();
+        this._pendingDecisionGroups.clear();
+        this._resetNotificationSource();
     }
 
     _startSettingsPolling() {
@@ -224,10 +249,13 @@ class UsbGuardPromptRuntime {
             GLib.PRIORITY_DEFAULT,
             SETTINGS_POLL_MS,
             () => {
-                const before = this._trayEnabled;
+                const wasTrayEnabled = this._trayEnabled;
+                const wasSuppressingPrompts = this._shouldSuppressPrompts();
                 this._reloadTraySettings();
-                if (before !== this._trayEnabled)
+                if (wasTrayEnabled !== this._trayEnabled)
                     this._applyTrayPreference();
+                if (!wasSuppressingPrompts && this._shouldSuppressPrompts())
+                    this._clearPendingPromptState();
                 return GLib.SOURCE_CONTINUE;
             }
         );
@@ -341,6 +369,64 @@ class UsbGuardPromptRuntime {
         return normalizedRule ? `rule:${normalizedRule}` : '';
     }
 
+    _normalizeTargetName(targetName) {
+        const normalized = String(targetName ?? '').toLowerCase();
+        if (normalized === 'reject')
+            return 'block';
+        if (normalized === 'allow' || normalized === 'block')
+            return normalized;
+        return 'unknown';
+    }
+
+    _buildIdentityKeyFromRuleText(ruleText) {
+        const identityCarrier = {
+            hash: this._extractRuleField(ruleText, 'hash'),
+            serial: this._extractRuleField(ruleText, 'serial'),
+            usbId: this._extractRuleUsbId(ruleText),
+            viaPort: this._extractRuleField(ruleText, 'via-port'),
+            rule: ruleText,
+        };
+        return this._buildRuleIdentityKey(identityCarrier);
+    }
+
+    async _listPermanentRules() {
+        const args = new GLib.Variant('(s)', ['']);
+        const replyType = new GLib.VariantType('(a(us))');
+        let lastError = null;
+
+        for (const objectPath of this._usbguardBackend.policyObjectPaths) {
+            try {
+                const reply = await this._callUsbguardMethod(
+                    objectPath,
+                    'listRules',
+                    args,
+                    replyType,
+                    this._usbguardBackend.policyInterface
+                );
+                const [rules] = reply.deepUnpack();
+                return rules ?? [];
+            } catch (error) {
+                lastError = error;
+            }
+        }
+
+        throw lastError ?? new Error('USBGuard listRules call failed');
+    }
+
+    _buildPermanentTargetByIdentity(rules) {
+        const targets = new Map();
+        for (const [_ruleId, ruleText] of rules) {
+            const key = this._buildIdentityKeyFromRuleText(ruleText);
+            if (!key)
+                continue;
+            const target = this._normalizeTargetName(this._extractRuleTarget(ruleText));
+            if (target === 'unknown')
+                continue;
+            targets.set(key, target);
+        }
+        return targets;
+    }
+
     async _listConnectedDevices() {
         const args = new GLib.Variant('(s)', ['match']);
         const replyType = new GLib.VariantType('(a(us))');
@@ -367,23 +453,82 @@ class UsbGuardPromptRuntime {
     }
 
     _groupDevicesForTray(devices) {
-        const groups = [];
-        for (const device of devices) {
-            let group = null;
-            for (const existing of groups) {
-                if (this._shouldMergeWithDevices(device, existing.devicesByHash)) {
-                    group = existing;
-                    break;
+        if (devices.length <= 1)
+            return devices.length === 0 ? [] : [[devices[0]]];
+
+        const parents = devices.map((_, index) => index);
+        const find = index => {
+            while (parents[index] !== index) {
+                parents[index] = parents[parents[index]];
+                index = parents[index];
+            }
+            return index;
+        };
+        const union = (a, b) => {
+            const rootA = find(a);
+            const rootB = find(b);
+            if (rootA !== rootB)
+                parents[rootB] = rootA;
+        };
+
+        for (let i = 0; i < devices.length; i++) {
+            for (let j = i + 1; j < devices.length; j++) {
+                if (this._isMergeEligiblePair(devices[i], devices[j]) &&
+                    this._areDevicesTopologyRelated(devices[i], devices[j])) {
+                    union(i, j);
                 }
             }
-            if (!group) {
-                group = {devicesByHash: new Map()};
-                groups.push(group);
-            }
-            group.devicesByHash.set(device.hash, device);
         }
 
-        return groups.map(group => [...group.devicesByHash.values()]);
+        const groupsByRoot = new Map();
+        for (let index = 0; index < devices.length; index++) {
+            const root = find(index);
+            if (!groupsByRoot.has(root))
+                groupsByRoot.set(root, new Map());
+
+            const device = devices[index];
+            const key = device.hash || `id-${device.id}`;
+            groupsByRoot.get(root).set(key, device);
+        }
+
+        return [...groupsByRoot.values()].map(group => [...group.values()]);
+    }
+
+    _selectedActionForGroup(devices, permanentTargetByIdentity) {
+        if (devices.length === 0)
+            return null;
+
+        const states = devices.map(device => {
+            const currentTarget = this._normalizeTargetName(device.target);
+            const identity = this._buildRuleIdentityKey(device);
+            const permanentTarget = identity ? (permanentTargetByIdentity.get(identity) ?? null) : null;
+            return {
+                currentTarget,
+                permanentTarget,
+            };
+        });
+
+        if (states.some(state => state.currentTarget === 'unknown'))
+            return null;
+
+        const allAllow = states.every(state => state.currentTarget === 'allow');
+        const allBlock = states.every(state => state.currentTarget === 'block');
+        if (!allAllow && !allBlock)
+            return null;
+
+        if (allAllow) {
+            if (states.every(state => state.permanentTarget === 'allow'))
+                return 'allow_permanent';
+            if (states.every(state => state.permanentTarget === null))
+                return 'allow_once';
+            return null;
+        }
+
+        if (states.every(state => state.permanentTarget === 'block'))
+            return 'block_permanent';
+        if (states.every(state => state.permanentTarget === null))
+            return 'block_once';
+        return null;
     }
 
     async _applyPolicyToDeviceGroup(devices, target, permanent) {
@@ -432,6 +577,14 @@ class UsbGuardPromptRuntime {
             return;
         }
 
+        let permanentTargetByIdentity = new Map();
+        try {
+            const rules = await this._listPermanentRules();
+            permanentTargetByIdentity = this._buildPermanentTargetByIdentity(rules);
+        } catch (error) {
+            logException(error, 'Failed to load permanent rules for tray status indicators');
+        }
+
         const systemKeys = this._readSystemDeviceKeys();
         const nonSystemDevices = devices.filter(device => {
             const key = this._buildRuleIdentityKey(device);
@@ -448,8 +601,11 @@ class UsbGuardPromptRuntime {
 
         for (const groupDevices of grouped) {
             const subMenu = new PopupMenu.PopupSubMenuMenuItem(this._buildTrayGroupLabel(groupDevices));
-            const addAction = (label, target, permanent) => {
+            const selectedAction = this._selectedActionForGroup(groupDevices, permanentTargetByIdentity);
+            const addAction = (label, target, permanent, actionKey) => {
                 const actionItem = new PopupMenu.PopupMenuItem(label);
+                if (selectedAction === actionKey && typeof actionItem.setOrnament === 'function')
+                    actionItem.setOrnament(PopupMenu.Ornament.CHECK);
                 actionItem.connect('activate', () => {
                     void (async () => {
                         await this._applyPolicyToDeviceGroup(groupDevices, target, permanent);
@@ -459,10 +615,10 @@ class UsbGuardPromptRuntime {
                 subMenu.menu.addMenuItem(actionItem);
             };
 
-            addAction('Allow once', PolicyTarget.ALLOW, false);
-            addAction('Allow permanent', PolicyTarget.ALLOW, true);
-            addAction('Block once', PolicyTarget.BLOCK, false);
-            addAction('Block permanent', PolicyTarget.BLOCK, true);
+            addAction('Allow once', PolicyTarget.ALLOW, false, 'allow_once');
+            addAction('Allow permanent', PolicyTarget.ALLOW, true, 'allow_permanent');
+            addAction('Block once', PolicyTarget.BLOCK, false, 'block_once');
+            addAction('Block permanent', PolicyTarget.BLOCK, true, 'block_permanent');
 
             this._trayButton.menu.addMenuItem(subMenu);
         }
@@ -481,6 +637,9 @@ class UsbGuardPromptRuntime {
             void this._handleInsertWhileLocked(device);
             return;
         }
+
+        if (this._shouldSuppressPrompts())
+            return;
 
         const groupKey = this._groupKeyForDevice(device);
         const pendingDecision = this._findPendingDecisionContext(device, groupKey);
@@ -634,6 +793,11 @@ class UsbGuardPromptRuntime {
 
         if (this._pendingLockedDevices.size === 0)
             return;
+
+        if (this._shouldSuppressPrompts()) {
+            this._pendingLockedDevices.clear();
+            return;
+        }
 
         const devices = [...this._pendingLockedDevices.values()];
         this._pendingLockedDevices.clear();
@@ -1009,6 +1173,9 @@ class UsbGuardPromptRuntime {
     }
 
     _queuePrompt(device, groupKey = null) {
+        if (this._shouldSuppressPrompts())
+            return;
+
         const preferredKey = groupKey ?? this._groupKeyForDevice(device);
         const now = GLib.get_monotonic_time();
         let [key, group] = this._findPendingPromptGroup(device, preferredKey, now);
@@ -1030,6 +1197,9 @@ class UsbGuardPromptRuntime {
     }
 
     _showPromptForGroup(group) {
+        if (this._shouldSuppressPrompts())
+            return;
+
         const devices = [...group.devicesByHash.values()];
         if (devices.length === 0)
             return;
@@ -1197,12 +1367,12 @@ class UsbGuardPromptRuntime {
         throw lastError ?? new Error('USBGuard call failed');
     }
 
-    _callUsbguardMethod(objectPath, methodName, parameters, replyType) {
+    _callUsbguardMethod(objectPath, methodName, parameters, replyType, interfaceName = null) {
         return new Promise((resolve, reject) => {
             this._bus.call(
                 this._usbguardBackend.busName,
                 objectPath,
-                this._usbguardBackend.devicesInterface,
+                interfaceName ?? this._usbguardBackend.devicesInterface,
                 methodName,
                 parameters,
                 replyType,

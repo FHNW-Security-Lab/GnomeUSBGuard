@@ -317,6 +317,27 @@ export default class UsbGuardPromptPreferences extends ExtensionPreferences {
         });
         controlsGroup.add(this._trayIconRow);
 
+        this._trayNotificationRow = this._registerActionWidget(new Adw.SwitchRow({
+            title: 'Disable notifications when tray icon is enabled',
+            subtitle: 'Use tray menu only (no USB approval notifications) while tray icon is active.',
+            active: Boolean(this._runtimeSettings.disableNotificationsWhenTrayEnabled),
+        }));
+        this._trayNotificationRow.connect('notify::active', () => {
+            if (!this._trayNotificationRow)
+                return;
+
+            void this._runBusyTask(async () => {
+                this._runtimeSettings.disableNotificationsWhenTrayEnabled = this._trayNotificationRow.get_active();
+                this._saveRuntimeSettings();
+                this._setStatus(
+                    this._runtimeSettings.disableNotificationsWhenTrayEnabled
+                        ? 'Notifications are disabled while tray icon is enabled.'
+                        : 'Notifications are enabled.'
+                );
+            });
+        });
+        controlsGroup.add(this._trayNotificationRow);
+
         this._devicesGroup = new Adw.PreferencesGroup({
             title: 'Connected Devices',
             description: 'Active devices without permanent rules. Shows current status and lets you change state.',
@@ -463,23 +484,36 @@ export default class UsbGuardPromptPreferences extends ExtensionPreferences {
         const path = this._settingsPath();
         try {
             if (!GLib.file_test(path, GLib.FileTest.EXISTS))
-                return {trayIconEnabled: false};
+                return {
+                    trayIconEnabled: false,
+                    disableNotificationsWhenTrayEnabled: false,
+                };
 
             const [ok, contents] = GLib.file_get_contents(path);
             if (!ok)
-                return {trayIconEnabled: false};
+                return {
+                    trayIconEnabled: false,
+                    disableNotificationsWhenTrayEnabled: false,
+                };
 
             const text = new TextDecoder().decode(contents);
             const parsed = JSON.parse(text);
             if (!parsed || typeof parsed !== 'object')
-                return {trayIconEnabled: false};
+                return {
+                    trayIconEnabled: false,
+                    disableNotificationsWhenTrayEnabled: false,
+                };
 
             return {
                 trayIconEnabled: Boolean(parsed.trayIconEnabled),
+                disableNotificationsWhenTrayEnabled: Boolean(parsed.disableNotificationsWhenTrayEnabled),
             };
         } catch (error) {
             logError(error, '[usbguard-prompt] Failed to load runtime settings');
-            return {trayIconEnabled: false};
+            return {
+                trayIconEnabled: false,
+                disableNotificationsWhenTrayEnabled: false,
+            };
         }
     }
 
@@ -501,6 +535,9 @@ export default class UsbGuardPromptPreferences extends ExtensionPreferences {
             const payload = JSON.stringify({
                 ...existing,
                 trayIconEnabled: Boolean(this._runtimeSettings?.trayIconEnabled),
+                disableNotificationsWhenTrayEnabled: Boolean(
+                    this._runtimeSettings?.disableNotificationsWhenTrayEnabled
+                ),
             }, null, 2);
             GLib.file_set_contents(path, payload);
         } catch (error) {
