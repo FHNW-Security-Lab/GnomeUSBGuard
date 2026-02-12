@@ -27,7 +27,7 @@ const INSERT_EVENT = 1;
 const HUB_PROMPT_DEBOUNCE_MS = 2200;
 const BURST_MAX_WINDOW_MS = 5500;
 const FOLLOWUP_DECISION_WINDOW_MS = 2500;
-const REPEAT_INSERT_SUPPRESS_USEC = 3 * 1000 * 1000;
+const DUPLICATE_INSERT_SUPPRESS_USEC = 900 * 1000;
 const DBUS_CALL_TIMEOUT_MS = 2500;
 
 const PolicyTarget = {
@@ -320,16 +320,17 @@ class UsbGuardPromptRuntime {
 
     _shouldSuppressRepeatedInsert(device) {
         const now = GLib.get_monotonic_time();
-        const lastSeen = this._recentInsertions.get(device.hash);
-        this._recentInsertions.set(device.hash, now);
+        const insertKey = `${device.hash}|${device.viaPort || ''}|${device.id}`;
+        const lastSeen = this._recentInsertions.get(insertKey);
+        this._recentInsertions.set(insertKey, now);
 
-        const staleCutoff = now - REPEAT_INSERT_SUPPRESS_USEC * 4;
-        for (const [hash, seenAt] of this._recentInsertions.entries()) {
+        const staleCutoff = now - DUPLICATE_INSERT_SUPPRESS_USEC * 6;
+        for (const [key, seenAt] of this._recentInsertions.entries()) {
             if (seenAt < staleCutoff)
-                this._recentInsertions.delete(hash);
+                this._recentInsertions.delete(key);
         }
 
-        return lastSeen !== undefined && now - lastSeen < REPEAT_INSERT_SUPPRESS_USEC;
+        return lastSeen !== undefined && now - lastSeen < DUPLICATE_INSERT_SUPPRESS_USEC;
     }
 
     _extractPortPath(viaPort) {

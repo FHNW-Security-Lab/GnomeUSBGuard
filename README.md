@@ -26,6 +26,8 @@ The action buttons map to `org.usbguard.Devices.applyDevicePolicy(...)`.
 - After you allow the initial hub burst, immediate follow-up devices on the
   same physical port reuse that decision for a very short grace window to avoid
   repeated prompts during late enumeration.
+- Duplicate insert suppression is scoped to the same device and same port, so
+  reinserting into a different port is prompted again.
 - Devices connected through the hub later are prompted again as separate
   devices.
 - If the screen is locked, newly inserted devices are immediately **blocked once**
