@@ -26,7 +26,7 @@ const SCREENSAVER_OBJECT_PATH = '/org/gnome/ScreenSaver';
 const INSERT_EVENT = 1;
 const HUB_PROMPT_DEBOUNCE_MS = 2200;
 const BURST_MAX_WINDOW_MS = 5500;
-const FOLLOWUP_DECISION_WINDOW_MS = 10000;
+const FOLLOWUP_DECISION_WINDOW_MS = 2500;
 const REPEAT_INSERT_SUPPRESS_USEC = 3 * 1000 * 1000;
 const DBUS_CALL_TIMEOUT_MS = 2500;
 
@@ -82,6 +82,7 @@ class UsbGuardPromptRuntime {
         this._screenSignalSubscriptionId = 0;
         this._screenLocked = false;
         this._pendingPromptGroups = new Map();
+        this._pendingDecisionGroups = new Map();
         this._recentInsertions = new Map();
         this._pendingLockedDevices = new Map();
         this._followupDecisions = new Map();
@@ -134,6 +135,7 @@ class UsbGuardPromptRuntime {
                 GLib.source_remove(group.timerId);
         }
         this._pendingPromptGroups.clear();
+        this._pendingDecisionGroups.clear();
         this._recentInsertions.clear();
         this._pendingLockedDevices.clear();
         this._followupDecisions.clear();
@@ -164,6 +166,12 @@ class UsbGuardPromptRuntime {
         }
 
         const groupKey = this._groupKeyForDevice(device);
+        const pendingDecision = this._pendingDecisionGroups.get(groupKey);
+        if (pendingDecision) {
+            pendingDecision.devicesByHash.set(device.hash, device);
+            return;
+        }
+
         if (this._hasActiveFollowupDecision(groupKey)) {
             void this._applyFollowupDecision(device, groupKey);
             return;
@@ -433,9 +441,23 @@ class UsbGuardPromptRuntime {
         const title = this._buildPromptTitle(devices);
         const body = this._buildPromptBody(devices);
         const notification = createNotification(this._source, title, body);
+        const decisionContext = {
+            groupKey: group.groupKey,
+            devicesByHash: new Map(group.devicesByHash),
+            resolved: false,
+        };
+        this._pendingDecisionGroups.set(group.groupKey, decisionContext);
 
         if (typeof notification.setUrgency === 'function')
             notification.setUrgency(MessageTray.Urgency.HIGH);
+
+        if (typeof notification.connect === 'function') {
+            notification.connect('destroy', () => {
+                const active = this._pendingDecisionGroups.get(group.groupKey);
+                if (active === decisionContext && !decisionContext.resolved)
+                    this._pendingDecisionGroups.delete(group.groupKey);
+            });
+        }
 
         const addAction = (label, handler) => {
             if (typeof notification.addAction === 'function') {
@@ -446,16 +468,23 @@ class UsbGuardPromptRuntime {
         };
 
         addAction('Block once', () => {
-            void this._applyDecision(devices, PolicyTarget.BLOCK, false, group.groupKey);
+            void this._applyDecisionFromContext(decisionContext, PolicyTarget.BLOCK, false);
         });
         addAction('Allow once', () => {
-            void this._applyDecision(devices, PolicyTarget.ALLOW, false, group.groupKey);
+            void this._applyDecisionFromContext(decisionContext, PolicyTarget.ALLOW, false);
         });
         addAction('Allow always', () => {
-            void this._applyDecision(devices, PolicyTarget.ALLOW, true, group.groupKey);
+            void this._applyDecisionFromContext(decisionContext, PolicyTarget.ALLOW, true);
         });
 
         this._source.addNotification(notification);
+    }
+
+    async _applyDecisionFromContext(context, target, permanent) {
+        context.resolved = true;
+        this._pendingDecisionGroups.delete(context.groupKey);
+        const devices = [...context.devicesByHash.values()];
+        await this._applyDecision(devices, target, permanent, context.groupKey);
     }
 
     async _handleInsertWhileLocked(device) {
@@ -544,12 +573,11 @@ class UsbGuardPromptRuntime {
             }
         }
 
-        if (failures.length === 0)
+        if (failures.length === 0) {
             if (groupKey && target === PolicyTarget.ALLOW)
                 this._rememberFollowupDecision(groupKey, target, permanent);
-
-        if (failures.length === 0)
             return;
+        }
 
         Main.notifyError(
             'USBGuard policy update failed',

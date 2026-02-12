@@ -24,7 +24,7 @@ The action buttons map to `org.usbguard.Devices.applyDevicePolicy(...)`.
 - Grouping is time-window based; later devices added to the same hub are
   prompted again.
 - After you allow the initial hub burst, immediate follow-up devices on the
-  same physical port reuse that decision for a short grace window to avoid
+  same physical port reuse that decision for a very short grace window to avoid
   repeated prompts during late enumeration.
 - Devices connected through the hub later are prompted again as separate
   devices.
