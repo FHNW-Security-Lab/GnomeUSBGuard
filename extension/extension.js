@@ -1,8 +1,11 @@
 import GLib from 'gi://GLib';
 import Gio from 'gi://Gio';
+import St from 'gi://St';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as MessageTray from 'resource:///org/gnome/shell/ui/messageTray.js';
+import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
+import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 
 const USBGUARD_BACKENDS = [
@@ -31,6 +34,9 @@ const PENDING_DECISION_MERGE_WINDOW_MS = 15000;
 const POST_DECISION_ENUM_WINDOW_MS = 12000;
 const DUPLICATE_INSERT_SUPPRESS_USEC = 900 * 1000;
 const DBUS_CALL_TIMEOUT_MS = 2500;
+const SETTINGS_POLL_MS = 2000;
+const SETTINGS_FILENAME = 'settings.json';
+const SYSTEM_DEVICES_FILENAME = 'system-devices.json';
 
 const PolicyTarget = {
     ALLOW: 0,
@@ -88,6 +94,9 @@ class UsbGuardPromptRuntime {
         this._recentHubDecisions = new Map();
         this._recentInsertions = new Map();
         this._pendingLockedDevices = new Map();
+        this._trayEnabled = false;
+        this._traySettingsPollId = 0;
+        this._trayButton = null;
 
         try {
             this._bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, null);
@@ -117,6 +126,9 @@ class UsbGuardPromptRuntime {
         );
 
         this._setupScreenLockTracking();
+        this._reloadTraySettings();
+        this._applyTrayPreference();
+        this._startSettingsPolling();
 
         logInfo('Extension enabled');
     }
@@ -141,6 +153,8 @@ class UsbGuardPromptRuntime {
         this._recentHubDecisions.clear();
         this._recentInsertions.clear();
         this._pendingLockedDevices.clear();
+        this._stopSettingsPolling();
+        this._destroyTrayButton();
 
         this._resetNotificationSource();
 
@@ -148,6 +162,310 @@ class UsbGuardPromptRuntime {
         this._usbguardBackend = null;
         this._sessionBus = null;
         logInfo('Extension disabled');
+    }
+
+    _configDir() {
+        return GLib.build_filenamev([GLib.get_user_config_dir(), 'usbguard-prompt']);
+    }
+
+    _settingsPath() {
+        return GLib.build_filenamev([this._configDir(), SETTINGS_FILENAME]);
+    }
+
+    _systemDevicesPath() {
+        return GLib.build_filenamev([this._configDir(), SYSTEM_DEVICES_FILENAME]);
+    }
+
+    _readJsonFile(path) {
+        try {
+            if (!GLib.file_test(path, GLib.FileTest.EXISTS))
+                return null;
+
+            const [ok, contents] = GLib.file_get_contents(path);
+            if (!ok)
+                return null;
+
+            const text = new TextDecoder().decode(contents);
+            return JSON.parse(text);
+        } catch (error) {
+            logException(error, `Failed to parse JSON file: ${path}`);
+            return null;
+        }
+    }
+
+    _readSystemDeviceKeys() {
+        const data = this._readJsonFile(this._systemDevicesPath());
+        if (!Array.isArray(data))
+            return new Set();
+
+        return new Set(data.filter(value => typeof value === 'string' && value.length > 0));
+    }
+
+    _readTraySettings() {
+        const data = this._readJsonFile(this._settingsPath());
+        if (!data || typeof data !== 'object')
+            return {trayIconEnabled: false};
+
+        return {
+            trayIconEnabled: Boolean(data.trayIconEnabled),
+        };
+    }
+
+    _reloadTraySettings() {
+        const settings = this._readTraySettings();
+        this._trayEnabled = Boolean(settings.trayIconEnabled);
+    }
+
+    _startSettingsPolling() {
+        if (this._traySettingsPollId > 0)
+            GLib.source_remove(this._traySettingsPollId);
+
+        this._traySettingsPollId = GLib.timeout_add(
+            GLib.PRIORITY_DEFAULT,
+            SETTINGS_POLL_MS,
+            () => {
+                const before = this._trayEnabled;
+                this._reloadTraySettings();
+                if (before !== this._trayEnabled)
+                    this._applyTrayPreference();
+                return GLib.SOURCE_CONTINUE;
+            }
+        );
+    }
+
+    _stopSettingsPolling() {
+        if (this._traySettingsPollId > 0) {
+            GLib.source_remove(this._traySettingsPollId);
+            this._traySettingsPollId = 0;
+        }
+    }
+
+    _applyTrayPreference() {
+        if (this._trayEnabled)
+            this._ensureTrayButton();
+        else
+            this._destroyTrayButton();
+    }
+
+    _ensureTrayButton() {
+        if (this._trayButton)
+            return;
+
+        const button = new PanelMenu.Button(0.0, 'USBGuard');
+        const icon = new St.Icon({
+            icon_name: 'drive-removable-media-usb-symbolic',
+            style_class: 'system-status-icon',
+        });
+        button.add_child(icon);
+        button.menu.connect('open-state-changed', (_menu, isOpen) => {
+            if (isOpen)
+                void this._refreshTrayMenu();
+        });
+
+        Main.panel.addToStatusArea('usbguard-prompt-tray', button);
+        this._trayButton = button;
+        void this._refreshTrayMenu();
+    }
+
+    _destroyTrayButton() {
+        if (!this._trayButton)
+            return;
+
+        this._trayButton.destroy();
+        this._trayButton = null;
+    }
+
+    _extractRuleField(ruleText, fieldName) {
+        if (typeof ruleText !== 'string')
+            return '';
+
+        const escaped = fieldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const match = ruleText.match(new RegExp(`\\b${escaped}\\s+"([^"]+)"`, 'i'));
+        return match ? match[1] : '';
+    }
+
+    _extractRuleUsbId(ruleText) {
+        if (typeof ruleText !== 'string')
+            return '';
+        const match = ruleText.match(/\bid\s+([0-9a-f]{4}:[0-9a-f]{4})\b/i);
+        return match ? match[1].toLowerCase() : '';
+    }
+
+    _extractRuleTarget(ruleText) {
+        if (typeof ruleText !== 'string')
+            return 'unknown';
+        const match = ruleText.trim().match(/^(allow|block|reject)\b/i);
+        return match ? match[1].toLowerCase() : 'unknown';
+    }
+
+    _buildDeviceContextFromListedRule(deviceId, deviceRule) {
+        const name = this._extractRuleField(deviceRule, 'name') || `Device ${deviceId}`;
+        const hash = this._extractRuleField(deviceRule, 'hash') || `id-${deviceId}`;
+        const parentHash = this._extractRuleField(deviceRule, 'parent-hash');
+        const viaPort = this._extractRuleField(deviceRule, 'via-port');
+        const usbId = this._extractRuleUsbId(deviceRule);
+        const serial = this._extractRuleField(deviceRule, 'serial');
+        const interfaceDescriptor = this._extractRuleField(deviceRule, 'with-interface');
+
+        return {
+            id: deviceId,
+            hash,
+            parentHash,
+            viaPort,
+            usbId,
+            serial,
+            interfaceDescriptor,
+            name,
+            rule: deviceRule,
+            target: this._extractRuleTarget(deviceRule),
+            isHub: this._looksLikeUsbHub(name, interfaceDescriptor, deviceRule),
+        };
+    }
+
+    _buildRuleIdentityKey(device) {
+        if (device.hash)
+            return `hash:${device.hash}`;
+        if (device.serial && device.usbId)
+            return `id-serial:${device.usbId}|${device.serial}`;
+        if (device.serial)
+            return `serial:${device.serial}`;
+        if (device.usbId && device.viaPort)
+            return `id-port:${device.usbId}|${device.viaPort}`;
+        if (device.usbId)
+            return `usbid:${device.usbId}`;
+
+        const normalizedRule = String(device.rule ?? '')
+            .replace(/^\s*(allow|block|reject)\b/i, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+        return normalizedRule ? `rule:${normalizedRule}` : '';
+    }
+
+    async _listConnectedDevices() {
+        const args = new GLib.Variant('(s)', ['match']);
+        const replyType = new GLib.VariantType('(a(us))');
+        let lastError = null;
+
+        for (const objectPath of this._usbguardBackend.methodObjectPaths) {
+            try {
+                const reply = await this._callUsbguardMethod(
+                    objectPath,
+                    'listDevices',
+                    args,
+                    replyType
+                );
+                const [devices] = reply.deepUnpack();
+                return (devices ?? []).map(([deviceId, deviceRule]) =>
+                    this._buildDeviceContextFromListedRule(deviceId, deviceRule)
+                );
+            } catch (error) {
+                lastError = error;
+            }
+        }
+
+        throw lastError ?? new Error('USBGuard listDevices call failed');
+    }
+
+    _groupDevicesForTray(devices) {
+        const groups = [];
+        for (const device of devices) {
+            let group = null;
+            for (const existing of groups) {
+                if (this._shouldMergeWithDevices(device, existing.devicesByHash)) {
+                    group = existing;
+                    break;
+                }
+            }
+            if (!group) {
+                group = {devicesByHash: new Map()};
+                groups.push(group);
+            }
+            group.devicesByHash.set(device.hash, device);
+        }
+
+        return groups.map(group => [...group.devicesByHash.values()]);
+    }
+
+    async _applyPolicyToDeviceGroup(devices, target, permanent) {
+        const failures = [];
+        for (const device of devices) {
+            try {
+                await this._applyDevicePolicy(device.id, target, permanent);
+            } catch (error) {
+                failures.push(device.name);
+                logException(error, `Failed tray policy update for ${device.name}`);
+            }
+        }
+
+        if (failures.length > 0) {
+            Main.notifyError('USBGuard tray action failed', `Could not update: ${failures.join(', ')}`);
+            return;
+        }
+
+        Main.notify('USBGuard', `Updated ${devices.length} device(s).`);
+    }
+
+    _buildTrayGroupLabel(devices) {
+        if (devices.length === 1)
+            return `${devices[0].name} (${devices[0].target})`;
+
+        const names = devices.map(device => device.name);
+        const uniqueNames = [...new Set(names)];
+        const label = uniqueNames[0] || 'USB devices';
+        return `${label} (+${devices.length - 1})`;
+    }
+
+    async _refreshTrayMenu() {
+        if (!this._trayButton)
+            return;
+
+        this._trayButton.menu.removeAll();
+
+        let devices;
+        try {
+            devices = await this._listConnectedDevices();
+        } catch (error) {
+            logException(error, 'Failed to load devices for tray menu');
+            const item = new PopupMenu.PopupMenuItem('Failed to load devices');
+            item.setSensitive(false);
+            this._trayButton.menu.addMenuItem(item);
+            return;
+        }
+
+        const systemKeys = this._readSystemDeviceKeys();
+        const nonSystemDevices = devices.filter(device => {
+            const key = this._buildRuleIdentityKey(device);
+            return key ? !systemKeys.has(key) : true;
+        });
+
+        const grouped = this._groupDevicesForTray(nonSystemDevices);
+        if (grouped.length === 0) {
+            const item = new PopupMenu.PopupMenuItem('No non-System devices');
+            item.setSensitive(false);
+            this._trayButton.menu.addMenuItem(item);
+            return;
+        }
+
+        for (const groupDevices of grouped) {
+            const subMenu = new PopupMenu.PopupSubMenuMenuItem(this._buildTrayGroupLabel(groupDevices));
+            const addAction = (label, target, permanent) => {
+                const actionItem = new PopupMenu.PopupMenuItem(label);
+                actionItem.connect('activate', () => {
+                    void (async () => {
+                        await this._applyPolicyToDeviceGroup(groupDevices, target, permanent);
+                        await this._refreshTrayMenu();
+                    })();
+                });
+                subMenu.menu.addMenuItem(actionItem);
+            };
+
+            addAction('Allow once', PolicyTarget.ALLOW, false);
+            addAction('Allow permanent', PolicyTarget.ALLOW, true);
+            addAction('Block once', PolicyTarget.BLOCK, false);
+            addAction('Block permanent', PolicyTarget.BLOCK, true);
+
+            this._trayButton.menu.addMenuItem(subMenu);
+        }
     }
 
     _onDevicePresenceChanged(_connection, _sender, _path, _interfaceName, _signalName, parameters) {

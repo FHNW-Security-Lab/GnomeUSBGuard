@@ -29,6 +29,7 @@ const TARGET_NAME_TO_NUMERIC = {
     block: 1,
     reject: 2,
 };
+const SETTINGS_FILENAME = 'settings.json';
 const SYSTEM_DEVICES_FILENAME = 'system-devices.json';
 
 function escapeRegex(value) {
@@ -241,6 +242,7 @@ export default class UsbGuardPromptPreferences extends ExtensionPreferences {
         this._ruleRows = [];
         this._busy = false;
         this._systemDeviceKeys = new Set();
+        this._runtimeSettings = this._loadRuntimeSettings();
 
         window.set_default_size(1100, 760);
         window.set_search_enabled(true);
@@ -297,6 +299,23 @@ export default class UsbGuardPromptPreferences extends ExtensionPreferences {
         });
         this._statusRow.activatable = false;
         controlsGroup.add(this._statusRow);
+
+        this._trayIconRow = this._registerActionWidget(new Adw.SwitchRow({
+            title: 'Enable tray icon',
+            subtitle: 'Show non-System device groups in the top bar with quick allow/block actions.',
+            active: Boolean(this._runtimeSettings.trayIconEnabled),
+        }));
+        this._trayIconRow.connect('notify::active', () => {
+            if (!this._trayIconRow)
+                return;
+
+            void this._runBusyTask(async () => {
+                this._runtimeSettings.trayIconEnabled = this._trayIconRow.get_active();
+                this._saveRuntimeSettings();
+                this._setStatus(`Tray icon ${this._runtimeSettings.trayIconEnabled ? 'enabled' : 'disabled'}.`);
+            });
+        });
+        controlsGroup.add(this._trayIconRow);
 
         this._devicesGroup = new Adw.PreferencesGroup({
             title: 'Connected Devices',
@@ -430,6 +449,64 @@ export default class UsbGuardPromptPreferences extends ExtensionPreferences {
     _setStatus(message) {
         if (this._statusRow)
             this._statusRow.set_subtitle(message);
+    }
+
+    _settingsPath() {
+        return GLib.build_filenamev([
+            GLib.get_user_config_dir(),
+            'usbguard-prompt',
+            SETTINGS_FILENAME,
+        ]);
+    }
+
+    _loadRuntimeSettings() {
+        const path = this._settingsPath();
+        try {
+            if (!GLib.file_test(path, GLib.FileTest.EXISTS))
+                return {trayIconEnabled: false};
+
+            const [ok, contents] = GLib.file_get_contents(path);
+            if (!ok)
+                return {trayIconEnabled: false};
+
+            const text = new TextDecoder().decode(contents);
+            const parsed = JSON.parse(text);
+            if (!parsed || typeof parsed !== 'object')
+                return {trayIconEnabled: false};
+
+            return {
+                trayIconEnabled: Boolean(parsed.trayIconEnabled),
+            };
+        } catch (error) {
+            logError(error, '[usbguard-prompt] Failed to load runtime settings');
+            return {trayIconEnabled: false};
+        }
+    }
+
+    _saveRuntimeSettings() {
+        const path = this._settingsPath();
+        const dir = GLib.path_get_dirname(path);
+        try {
+            let existing = {};
+            if (GLib.file_test(path, GLib.FileTest.EXISTS)) {
+                const [ok, contents] = GLib.file_get_contents(path);
+                if (ok) {
+                    const parsed = JSON.parse(new TextDecoder().decode(contents));
+                    if (parsed && typeof parsed === 'object')
+                        existing = parsed;
+                }
+            }
+
+            GLib.mkdir_with_parents(dir, 0o700);
+            const payload = JSON.stringify({
+                ...existing,
+                trayIconEnabled: Boolean(this._runtimeSettings?.trayIconEnabled),
+            }, null, 2);
+            GLib.file_set_contents(path, payload);
+        } catch (error) {
+            logError(error, '[usbguard-prompt] Failed to persist runtime settings');
+            throw error;
+        }
     }
 
     _systemDevicesPath() {
