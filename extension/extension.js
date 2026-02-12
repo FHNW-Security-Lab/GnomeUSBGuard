@@ -26,6 +26,7 @@ const SCREENSAVER_OBJECT_PATH = '/org/gnome/ScreenSaver';
 const INSERT_EVENT = 1;
 const HUB_PROMPT_DEBOUNCE_MS = 2200;
 const BURST_MAX_WINDOW_MS = 5500;
+const FOLLOWUP_DECISION_WINDOW_MS = 10000;
 const REPEAT_INSERT_SUPPRESS_USEC = 3 * 1000 * 1000;
 const DBUS_CALL_TIMEOUT_MS = 2500;
 
@@ -83,6 +84,7 @@ class UsbGuardPromptRuntime {
         this._pendingPromptGroups = new Map();
         this._recentInsertions = new Map();
         this._pendingLockedDevices = new Map();
+        this._followupDecisions = new Map();
 
         try {
             this._bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, null);
@@ -134,6 +136,7 @@ class UsbGuardPromptRuntime {
         this._pendingPromptGroups.clear();
         this._recentInsertions.clear();
         this._pendingLockedDevices.clear();
+        this._followupDecisions.clear();
 
         if (this._source) {
             this._source.destroy();
@@ -160,7 +163,13 @@ class UsbGuardPromptRuntime {
             return;
         }
 
-        this._queuePrompt(device);
+        const groupKey = this._groupKeyForDevice(device);
+        if (this._hasActiveFollowupDecision(groupKey)) {
+            void this._applyFollowupDecision(device, groupKey);
+            return;
+        }
+
+        this._queuePrompt(device, groupKey);
     }
 
     _detectUsbguardBackend() {
@@ -387,26 +396,27 @@ class UsbGuardPromptRuntime {
         this._showPromptForGroup(group);
     }
 
-    _queuePrompt(device) {
-        const groupKey = this._groupKeyForDevice(device);
+    _queuePrompt(device, groupKey = null) {
+        const key = groupKey ?? this._groupKeyForDevice(device);
         const now = GLib.get_monotonic_time();
-        let group = this._pendingPromptGroups.get(groupKey);
+        let group = this._pendingPromptGroups.get(key);
         if (group && now - group.createdAtUsec > BURST_MAX_WINDOW_MS * 1000) {
-            this._flushGroup(groupKey, group);
+            this._flushGroup(key, group);
             group = null;
         }
 
         if (!group) {
             group = {
                 timerId: 0,
+                groupKey: key,
                 createdAtUsec: now,
                 devicesByHash: new Map(),
             };
-            this._pendingPromptGroups.set(groupKey, group);
+            this._pendingPromptGroups.set(key, group);
         }
 
         group.devicesByHash.set(device.hash, device);
-        this._scheduleGroupTimer(groupKey, group);
+        this._scheduleGroupTimer(key, group);
     }
 
     _showPromptForGroup(group) {
@@ -436,13 +446,13 @@ class UsbGuardPromptRuntime {
         };
 
         addAction('Block once', () => {
-            void this._applyDecision(devices, PolicyTarget.BLOCK, false);
+            void this._applyDecision(devices, PolicyTarget.BLOCK, false, group.groupKey);
         });
         addAction('Allow once', () => {
-            void this._applyDecision(devices, PolicyTarget.ALLOW, false);
+            void this._applyDecision(devices, PolicyTarget.ALLOW, false, group.groupKey);
         });
         addAction('Allow always', () => {
-            void this._applyDecision(devices, PolicyTarget.ALLOW, true);
+            void this._applyDecision(devices, PolicyTarget.ALLOW, true, group.groupKey);
         });
 
         this._source.addNotification(notification);
@@ -459,6 +469,43 @@ class UsbGuardPromptRuntime {
                 'USBGuard lock-screen policy failed',
                 `Could not temporarily block ${device.name} while screen was locked.`
             );
+        }
+    }
+
+    _hasActiveFollowupDecision(groupKey) {
+        const decision = this._followupDecisions.get(groupKey);
+        if (!decision)
+            return false;
+
+        const now = GLib.get_monotonic_time();
+        if (decision.expiresAtUsec <= now) {
+            this._followupDecisions.delete(groupKey);
+            return false;
+        }
+
+        return true;
+    }
+
+    _rememberFollowupDecision(groupKey, target, permanent) {
+        const now = GLib.get_monotonic_time();
+        this._followupDecisions.set(groupKey, {
+            target,
+            permanent,
+            expiresAtUsec: now + FOLLOWUP_DECISION_WINDOW_MS * 1000,
+        });
+    }
+
+    async _applyFollowupDecision(device, groupKey) {
+        const decision = this._followupDecisions.get(groupKey);
+        if (!decision)
+            return;
+
+        try {
+            await this._applyDevicePolicy(device.id, decision.target, decision.permanent);
+        } catch (error) {
+            this._followupDecisions.delete(groupKey);
+            logException(error, `Failed to apply follow-up decision for ${device.name}`);
+            this._queuePrompt(device, groupKey);
         }
     }
 
@@ -486,7 +533,7 @@ class UsbGuardPromptRuntime {
         return `${preview}${suffix}\nChoose how these devices should be handled.`;
     }
 
-    async _applyDecision(devices, target, permanent) {
+    async _applyDecision(devices, target, permanent, groupKey = null) {
         const failures = [];
         for (const device of devices) {
             try {
@@ -496,6 +543,10 @@ class UsbGuardPromptRuntime {
                 logException(error, `Failed to apply policy for ${device.name}`);
             }
         }
+
+        if (failures.length === 0)
+            if (groupKey && target === PolicyTarget.ALLOW)
+                this._rememberFollowupDecision(groupKey, target, permanent);
 
         if (failures.length === 0)
             return;

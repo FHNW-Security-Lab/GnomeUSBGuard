@@ -23,6 +23,9 @@ The action buttons map to `org.usbguard.Devices.applyDevicePolicy(...)`.
   example hub + card reader functions) are grouped into one prompt burst.
 - Grouping is time-window based; later devices added to the same hub are
   prompted again.
+- After you allow the initial hub burst, immediate follow-up devices on the
+  same physical port reuse that decision for a short grace window to avoid
+  repeated prompts during late enumeration.
 - Devices connected through the hub later are prompted again as separate
   devices.
 - If the screen is locked, newly inserted devices are immediately **blocked once**
