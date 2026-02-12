@@ -1109,6 +1109,20 @@ class UsbGuardPromptRuntime {
         return match ? match[1] : viaPort;
     }
 
+    _splitViaPort(viaPort) {
+        if (!viaPort)
+            return {bus: '', path: ''};
+
+        const match = String(viaPort).match(/^(\d+)-(.+)$/);
+        if (!match)
+            return {bus: '', path: String(viaPort)};
+
+        return {
+            bus: match[1],
+            path: match[2],
+        };
+    }
+
     _isPathAncestorOrSame(pathA, pathB) {
         if (!pathA || !pathB)
             return false;
@@ -1139,15 +1153,19 @@ class UsbGuardPromptRuntime {
         if (deviceA.serial !== deviceB.serial)
             return false;
 
-        const pathA = this._extractPortPath(deviceA.viaPort);
-        const pathB = this._extractPortPath(deviceB.viaPort);
-        if (!pathA || !pathB)
+        const portA = this._splitViaPort(deviceA.viaPort);
+        const portB = this._splitViaPort(deviceB.viaPort);
+        if (!portA.path || !portB.path)
             return false;
 
-        // Top-level hub pairs (USB2/USB3 companion interfaces) often differ only by host bus.
-        const depthA = pathA.split('.').length;
-        const depthB = pathB.split('.').length;
-        return depthA === 1 && depthB === 1;
+        // Companion entries for one physical hub share the same topology path,
+        // but typically differ by root USB bus number (USB2 vs USB3 view).
+        if (portA.path !== portB.path)
+            return false;
+        if (!portA.bus || !portB.bus || portA.bus === portB.bus)
+            return false;
+
+        return true;
     }
 
     _areDevicesTopologyRelated(deviceA, deviceB) {
@@ -1162,8 +1180,12 @@ class UsbGuardPromptRuntime {
         if (deviceB.parentHash && (deviceB.parentHash === deviceA.hash || deviceB.parentHash === deviceA.parentHash))
             return true;
 
-        // Some USB2/USB3 companion entries do not expose parent relationships.
+        // Last-resort match for backends that omit both path and parent metadata.
+        const hasExplicitTopology = Boolean((pathA && pathB) || deviceA.parentHash || deviceB.parentHash);
         if (deviceA.usbId && deviceA.usbId === deviceB.usbId && (deviceA.isHub || deviceB.isHub)) {
+            if (hasExplicitTopology)
+                return false;
+
             if (deviceA.serial && deviceB.serial)
                 return deviceA.serial === deviceB.serial;
 
@@ -1189,6 +1211,14 @@ class UsbGuardPromptRuntime {
         if (devicesByHash.has(device.hash))
             return true;
 
+        if (device.isHub) {
+            for (const existing of devicesByHash.values()) {
+                if (this._areLikelyCompanionHubInterfaces(device, existing))
+                    return true;
+            }
+            return false;
+        }
+
         if (device.parentHash && devicesByHash.has(device.parentHash))
             return true;
 
@@ -1212,11 +1242,10 @@ class UsbGuardPromptRuntime {
     }
 
     _groupKeyForDevice(device) {
-        // Use full bus-independent topology path as primary key.
-        // Example: "3-1.4.2" and "4-1.4.2" both map to "port:1.4.2".
-        const portPath = this._extractPortPath(device.viaPort);
-        if (portPath)
-            return `port:${portPath}`;
+        // Keep bus-specific via-port as key so identical hubs on different
+        // host ports never collapse into one decision context.
+        if (device.viaPort)
+            return `via:${device.viaPort}`;
 
         if (device.parentHash)
             return `parent:${device.parentHash}`;
