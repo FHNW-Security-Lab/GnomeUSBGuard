@@ -73,8 +73,8 @@ function createNotification(source, title, body) {
 
 class UsbGuardPromptRuntime {
     enable() {
-        this._source = createSource();
-        Main.messageTray.add(this._source);
+        this._source = null;
+        this._ensureNotificationSource();
 
         this._bus = null;
         this._usbguardBackend = null;
@@ -139,10 +139,7 @@ class UsbGuardPromptRuntime {
         this._recentInsertions.clear();
         this._pendingLockedDevices.clear();
 
-        if (this._source) {
-            this._source.destroy();
-            this._source = null;
-        }
+        this._resetNotificationSource();
 
         this._bus = null;
         this._usbguardBackend = null;
@@ -172,6 +169,52 @@ class UsbGuardPromptRuntime {
         }
 
         this._queuePrompt(device, groupKey);
+    }
+
+    _isNotificationSourceUsable(source) {
+        if (!source)
+            return false;
+
+        try {
+            return typeof source.addNotification === 'function';
+        } catch (error) {
+            return false;
+        }
+    }
+
+    _resetNotificationSource() {
+        if (!this._source)
+            return;
+
+        try {
+            this._source.destroy();
+        } catch (error) {
+            // Source can already be disposed by Shell internals.
+        }
+        this._source = null;
+    }
+
+    _ensureNotificationSource() {
+        if (this._isNotificationSourceUsable(this._source))
+            return true;
+
+        this._source = null;
+        try {
+            const source = createSource();
+            if (typeof source.connect === 'function') {
+                source.connect('destroy', () => {
+                    if (this._source === source)
+                        this._source = null;
+                });
+            }
+            Main.messageTray.add(source);
+            this._source = source;
+            return true;
+        } catch (error) {
+            logException(error, 'Failed to create USBGuard notification source');
+            this._source = null;
+            return false;
+        }
     }
 
     _detectUsbguardBackend() {
@@ -524,45 +567,70 @@ class UsbGuardPromptRuntime {
 
         const title = this._buildPromptTitle(devices);
         const body = this._buildPromptBody(devices);
-        const notification = createNotification(this._source, title, body);
         const decisionContext = {
             groupKey: group.groupKey,
             devicesByHash: new Map(group.devicesByHash),
             createdAtUsec: GLib.get_monotonic_time(),
             resolved: false,
         };
-        this._pendingDecisionGroups.set(group.groupKey, decisionContext);
-
-        if (typeof notification.setUrgency === 'function')
-            notification.setUrgency(MessageTray.Urgency.HIGH);
-
-        if (typeof notification.connect === 'function') {
-            notification.connect('destroy', () => {
-                const active = this._pendingDecisionGroups.get(group.groupKey);
-                if (active === decisionContext && !decisionContext.resolved)
-                    this._pendingDecisionGroups.delete(group.groupKey);
-            });
+        const published = this._publishDecisionNotification(title, body, decisionContext);
+        if (!published) {
+            Main.notifyError(
+                'USBGuard Prompt',
+                'Failed to show USB approval prompt. Check GNOME Shell logs.'
+            );
+            return;
         }
 
-        const addAction = (label, handler) => {
-            if (typeof notification.addAction === 'function') {
-                notification.addAction(label, handler);
-            } else {
-                logInfo(`Notification backend has no action support, ignoring "${label}"`);
+        this._pendingDecisionGroups.set(group.groupKey, decisionContext);
+    }
+
+    _publishDecisionNotification(title, body, decisionContext) {
+        for (let attempt = 0; attempt < 2; attempt++) {
+            if (!this._ensureNotificationSource())
+                continue;
+
+            try {
+                const notification = createNotification(this._source, title, body);
+
+                if (typeof notification.setUrgency === 'function')
+                    notification.setUrgency(MessageTray.Urgency.HIGH);
+
+                if (typeof notification.connect === 'function') {
+                    notification.connect('destroy', () => {
+                        const active = this._pendingDecisionGroups.get(decisionContext.groupKey);
+                        if (active === decisionContext && !decisionContext.resolved)
+                            this._pendingDecisionGroups.delete(decisionContext.groupKey);
+                    });
+                }
+
+                const addAction = (label, handler) => {
+                    if (typeof notification.addAction === 'function') {
+                        notification.addAction(label, handler);
+                    } else {
+                        logInfo(`Notification backend has no action support, ignoring "${label}"`);
+                    }
+                };
+
+                addAction('Block once', () => {
+                    void this._applyDecisionFromContext(decisionContext, PolicyTarget.BLOCK, false);
+                });
+                addAction('Allow once', () => {
+                    void this._applyDecisionFromContext(decisionContext, PolicyTarget.ALLOW, false);
+                });
+                addAction('Allow always', () => {
+                    void this._applyDecisionFromContext(decisionContext, PolicyTarget.ALLOW, true);
+                });
+
+                this._source.addNotification(notification);
+                return true;
+            } catch (error) {
+                logException(error, 'Failed to publish USBGuard notification, recreating source');
+                this._resetNotificationSource();
             }
-        };
+        }
 
-        addAction('Block once', () => {
-            void this._applyDecisionFromContext(decisionContext, PolicyTarget.BLOCK, false);
-        });
-        addAction('Allow once', () => {
-            void this._applyDecisionFromContext(decisionContext, PolicyTarget.ALLOW, false);
-        });
-        addAction('Allow always', () => {
-            void this._applyDecisionFromContext(decisionContext, PolicyTarget.ALLOW, true);
-        });
-
-        this._source.addNotification(notification);
+        return false;
     }
 
     async _applyDecisionFromContext(context, target, permanent) {
