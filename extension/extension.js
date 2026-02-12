@@ -27,8 +27,8 @@ const INSERT_EVENT = 1;
 const HUB_PROMPT_DEBOUNCE_MS = 4200;
 const DEVICE_PROMPT_DEBOUNCE_MS = 1200;
 const BURST_MAX_WINDOW_MS = 12000;
-const PENDING_DECISION_MERGE_WINDOW_MS = 4500;
-const POST_DECISION_ENUM_WINDOW_MS = 1800;
+const PENDING_DECISION_MERGE_WINDOW_MS = 15000;
+const POST_DECISION_ENUM_WINDOW_MS = 12000;
 const DUPLICATE_INSERT_SUPPRESS_USEC = 900 * 1000;
 const DBUS_CALL_TIMEOUT_MS = 2500;
 
@@ -171,7 +171,7 @@ class UsbGuardPromptRuntime {
             return;
         }
 
-        const recentHubDecision = this._findRecentHubDecision(device);
+        const recentHubDecision = device.isHub ? this._findRecentHubDecision(device) : null;
         if (recentHubDecision) {
             void this._applyRecentHubDecision(device, groupKey, recentHubDecision);
             return;
@@ -401,6 +401,38 @@ class UsbGuardPromptRuntime {
         return pathA.startsWith(`${pathB}.`) || pathB.startsWith(`${pathA}.`);
     }
 
+    _extractVendorId(usbId) {
+        const value = String(usbId ?? '').toLowerCase();
+        const match = value.match(/^([0-9a-f]{4}):[0-9a-f]{4}$/);
+        return match ? match[1] : '';
+    }
+
+    _areLikelyCompanionHubInterfaces(deviceA, deviceB) {
+        if (!deviceA.isHub || !deviceB.isHub)
+            return false;
+
+        const vendorA = this._extractVendorId(deviceA.usbId);
+        const vendorB = this._extractVendorId(deviceB.usbId);
+        if (!vendorA || vendorA !== vendorB)
+            return false;
+
+        if (!deviceA.serial || !deviceB.serial)
+            return false;
+
+        if (deviceA.serial !== deviceB.serial)
+            return false;
+
+        const pathA = this._extractPortPath(deviceA.viaPort);
+        const pathB = this._extractPortPath(deviceB.viaPort);
+        if (!pathA || !pathB)
+            return false;
+
+        // Top-level hub pairs (USB2/USB3 companion interfaces) often differ only by host bus.
+        const depthA = pathA.split('.').length;
+        const depthB = pathB.split('.').length;
+        return depthA === 1 && depthB === 1;
+    }
+
     _areDevicesTopologyRelated(deviceA, deviceB) {
         const pathA = this._extractPortPath(deviceA.viaPort);
         const pathB = this._extractPortPath(deviceB.viaPort);
@@ -420,6 +452,9 @@ class UsbGuardPromptRuntime {
 
             return deviceA.name === deviceB.name;
         }
+
+        if (this._areLikelyCompanionHubInterfaces(deviceA, deviceB))
+            return true;
 
         return false;
     }
@@ -445,6 +480,9 @@ class UsbGuardPromptRuntime {
             return false;
 
         for (const existing of devicesByHash.values()) {
+            if (this._areLikelyCompanionHubInterfaces(device, existing))
+                return true;
+
             const existingPath = this._extractPortPath(existing.viaPort);
             if (!existingPath)
                 continue;
