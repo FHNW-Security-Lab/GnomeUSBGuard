@@ -297,12 +297,12 @@ export default class UsbGuardPromptPreferences extends ExtensionPreferences {
 
         this._devicesGroup = new Adw.PreferencesGroup({
             title: 'Connected Devices',
-            description: 'Change policy for active devices (allow/block once or permanently) or reset matching permanent rules.',
+            description: 'Active devices without permanent rules. Shows current status and lets you change state.',
         });
 
         this._rulesGroup = new Adw.PreferencesGroup({
             title: 'Permanent Rules',
-            description: 'Edit or remove USBGuard rules persisted in policy.',
+            description: 'Devices/rules persisted in USBGuard policy with current status, change, and remove actions.',
         });
 
         page.add(controlsGroup);
@@ -356,32 +356,44 @@ export default class UsbGuardPromptPreferences extends ExtensionPreferences {
         rowsList.length = 0;
     }
 
-    _createActionSelector(actionLabels) {
-        const stringList = Gtk.StringList.new(actionLabels);
-        const dropdown = this._registerActionWidget(new Gtk.DropDown({
-            model: stringList,
-            selected: 0,
+    _createChangeMenuButton(actions) {
+        const menuButton = this._registerActionWidget(new Gtk.MenuButton({
+            label: 'Change',
             valign: Gtk.Align.CENTER,
         }));
 
-        const applyButton = this._registerActionButton(new Gtk.Button({
-            label: 'Apply',
-            valign: Gtk.Align.CENTER,
-        }));
-
-        const actionBox = new Gtk.Box({
-            orientation: Gtk.Orientation.HORIZONTAL,
-            spacing: 6,
-            valign: Gtk.Align.CENTER,
+        const popover = new Gtk.Popover({
+            hasArrow: true,
+            autohide: true,
         });
-        actionBox.append(dropdown);
-        actionBox.append(applyButton);
+        const list = new Gtk.Box({
+            orientation: Gtk.Orientation.VERTICAL,
+            spacing: 6,
+            margin_top: 8,
+            margin_bottom: 8,
+            margin_start: 8,
+            margin_end: 8,
+        });
 
-        return {
-            actionBox,
-            dropdown,
-            applyButton,
-        };
+        for (const action of actions) {
+            const button = this._registerActionButton(new Gtk.Button({
+                label: action.label,
+                halign: Gtk.Align.FILL,
+                hexpand: true,
+            }));
+            button.connect('clicked', () => {
+                popover.popdown();
+                void this._runBusyTask(async () => {
+                    await action.run();
+                    await this._refreshAll();
+                });
+            });
+            list.append(button);
+        }
+
+        popover.set_child(list);
+        menuButton.set_popover(popover);
+        return menuButton;
     }
 
     _setStatus(message) {
@@ -395,18 +407,48 @@ export default class UsbGuardPromptPreferences extends ExtensionPreferences {
             this._client.listRules(),
         ]);
 
-        this._renderDevices(devices);
-        this._renderRules(rules);
-        this._setStatus(`Loaded ${devices.length} connected devices and ${rules.length} permanent rules.`);
+        const parsedDevices = devices.map(([deviceId, deviceRule]) => ({
+            deviceId,
+            deviceRule,
+            parsed: parseRuleText(deviceRule),
+        }));
+
+        const permanentRuleMatchesByDeviceId = new Map();
+        const connectedDevicesByRuleId = new Map();
+        for (const device of parsedDevices) {
+            const matches = this._findRulesMatchingDevice(rules, device.parsed);
+            permanentRuleMatchesByDeviceId.set(device.deviceId, matches);
+            for (const [ruleId] of matches) {
+                if (!connectedDevicesByRuleId.has(ruleId))
+                    connectedDevicesByRuleId.set(ruleId, []);
+                connectedDevicesByRuleId.get(ruleId).push(device);
+            }
+        }
+
+        this._renderDevices(parsedDevices, permanentRuleMatchesByDeviceId);
+        this._renderRules(rules, connectedDevicesByRuleId);
+
+        const transientCount = parsedDevices.filter(device => {
+            const matches = permanentRuleMatchesByDeviceId.get(device.deviceId) ?? [];
+            return matches.length === 0;
+        }).length;
+        this._setStatus(
+            `Loaded ${parsedDevices.length} connected devices (${transientCount} without permanent rule) and ${rules.length} permanent rules.`
+        );
     }
 
-    _renderDevices(devices) {
+    _renderDevices(parsedDevices, permanentRuleMatchesByDeviceId) {
         this._clearGroupRows(this._devicesGroup, this._deviceRows);
 
-        if (devices.length === 0) {
+        const visibleDevices = parsedDevices.filter(device => {
+            const matches = permanentRuleMatchesByDeviceId.get(device.deviceId) ?? [];
+            return matches.length === 0;
+        });
+
+        if (visibleDevices.length === 0) {
             const emptyRow = new Adw.ActionRow({
-                title: 'No connected devices',
-                subtitle: 'No USBGuard device entries returned for query "match".',
+                title: 'No non-permanent connected devices',
+                subtitle: 'Devices with permanent rules are listed under "Permanent Rules".',
             });
             emptyRow.activatable = false;
             this._devicesGroup.add(emptyRow);
@@ -414,11 +456,12 @@ export default class UsbGuardPromptPreferences extends ExtensionPreferences {
             return;
         }
 
-        for (const [deviceId, deviceRule] of devices) {
-            const parsed = parseRuleText(deviceRule);
+        for (const device of visibleDevices) {
+            const {deviceId, parsed} = device;
             const title = parsed.name || parsed.hash || parsed.usbId || `Device ${deviceId}`;
             const subtitleParts = [
                 `id=${deviceId}`,
+                `status=${parsed.target}`,
                 parsed.usbId ? `usb-id=${parsed.usbId}` : null,
                 parsed.serial ? `serial=${compactValue(parsed.serial, 8, 4)}` : null,
                 parsed.hash ? `hash=${compactValue(parsed.hash, 8, 6)}` : null,
@@ -439,73 +482,37 @@ export default class UsbGuardPromptPreferences extends ExtensionPreferences {
                     label: 'Allow once',
                     run: async () => {
                         await this._client.applyDevicePolicy(deviceId, 'allow', false);
-                        this._setStatus(`Applied "allow once" to ${title}.`);
+                        this._setStatus(`Changed ${title} to allow once.`);
                     },
                 },
                 {
                     label: 'Allow always',
                     run: async () => {
                         await this._client.applyDevicePolicy(deviceId, 'allow', true);
-                        this._setStatus(`Applied permanent allow to ${title}.`);
+                        this._setStatus(`Changed ${title} to allow permanent.`);
                     },
                 },
                 {
                     label: 'Block once',
                     run: async () => {
                         await this._client.applyDevicePolicy(deviceId, 'block', false);
-                        this._setStatus(`Applied "block once" to ${title}.`);
+                        this._setStatus(`Changed ${title} to block once.`);
                     },
                 },
                 {
                     label: 'Block permanent',
                     run: async () => {
                         await this._client.applyDevicePolicy(deviceId, 'block', true);
-                        this._setStatus(`Applied permanent block to ${title}.`);
-                    },
-                },
-                {
-                    label: 'Reset rules',
-                    run: async () => {
-                        await this._resetRulesForDevice(title, parsed);
+                        this._setStatus(`Changed ${title} to block permanent.`);
                     },
                 },
             ];
 
-            const {
-                actionBox,
-                dropdown,
-                applyButton,
-            } = this._createActionSelector(actions.map(action => action.label));
-
-            applyButton.connect('clicked', () => {
-                const selected = Math.max(0, dropdown.get_selected());
-                const action = actions[selected] ?? actions[0];
-                void this._runBusyTask(async () => {
-                    await action.run();
-                    await this._refreshAll();
-                });
-            });
-
-            row.add_suffix(actionBox);
+            row.add_suffix(this._createChangeMenuButton(actions));
 
             this._devicesGroup.add(row);
             this._deviceRows.push(row);
         }
-    }
-
-    async _resetRulesForDevice(deviceTitle, parsedDeviceRule) {
-        const rules = await this._client.listRules();
-        const matchedRules = this._findRulesMatchingDevice(rules, parsedDeviceRule);
-
-        if (matchedRules.length === 0) {
-            this._setStatus(`No matching permanent rules found for ${deviceTitle}.`);
-            return;
-        }
-
-        for (const [ruleId] of matchedRules)
-            await this._client.removeRule(ruleId);
-
-        this._setStatus(`Removed ${matchedRules.length} permanent rule(s) for ${deviceTitle}.`);
     }
 
     _findRulesMatchingDevice(rules, parsedDeviceRule) {
@@ -527,7 +534,7 @@ export default class UsbGuardPromptPreferences extends ExtensionPreferences {
         return [];
     }
 
-    _renderRules(rules) {
+    _renderRules(rules, connectedDevicesByRuleId) {
         this._clearGroupRows(this._rulesGroup, this._ruleRows);
 
         if (rules.length === 0) {
@@ -544,9 +551,13 @@ export default class UsbGuardPromptPreferences extends ExtensionPreferences {
         for (const [ruleId, ruleText] of rules) {
             const parsed = parseRuleText(ruleText);
             const title = parsed.name || parsed.hash || parsed.usbId || `Rule ${ruleId}`;
+            const connectedDevices = connectedDevicesByRuleId.get(ruleId) ?? [];
+            const connectedStatuses = [...new Set(connectedDevices.map(device => device.parsed.target))];
             const subtitleParts = [
                 `#${ruleId}`,
-                `target=${parsed.target}`,
+                `status=${parsed.target}`,
+                connectedDevices.length > 0 ? `connected=${connectedDevices.length}` : 'connected=0',
+                connectedStatuses.length > 0 ? `device-status=${connectedStatuses.join(',')}` : 'device-status=n/a',
                 parsed.usbId ? `usb-id=${parsed.usbId}` : null,
                 parsed.serial ? `serial=${compactValue(parsed.serial, 8, 4)}` : null,
                 parsed.hash ? `hash=${compactValue(parsed.hash, 8, 6)}` : null,
@@ -582,31 +593,27 @@ export default class UsbGuardPromptPreferences extends ExtensionPreferences {
                         await this._changeRuleTarget(ruleId, ruleText, 'reject');
                     },
                 },
-                {
-                    label: 'Delete rule',
-                    run: async () => {
-                        await this._client.removeRule(ruleId);
-                        this._setStatus(`Deleted rule #${ruleId}.`);
-                    },
-                },
             ];
-
-            const {
-                actionBox,
-                dropdown,
-                applyButton,
-            } = this._createActionSelector(actions.map(action => action.label));
-
-            applyButton.connect('clicked', () => {
-                const selected = Math.max(0, dropdown.get_selected());
-                const action = actions[selected] ?? actions[0];
+            const controls = new Gtk.Box({
+                orientation: Gtk.Orientation.HORIZONTAL,
+                spacing: 6,
+                valign: Gtk.Align.CENTER,
+            });
+            controls.append(this._createChangeMenuButton(actions));
+            const removeButton = this._registerActionButton(new Gtk.Button({
+                label: 'Remove',
+                valign: Gtk.Align.CENTER,
+            }));
+            removeButton.connect('clicked', () => {
                 void this._runBusyTask(async () => {
-                    await action.run();
+                    await this._client.removeRule(ruleId);
+                    this._setStatus(`Removed permanent rule #${ruleId}.`);
                     await this._refreshAll();
                 });
             });
+            controls.append(removeButton);
 
-            row.add_suffix(actionBox);
+            row.add_suffix(controls);
 
             this._rulesGroup.add(row);
             this._ruleRows.push(row);
@@ -626,4 +633,3 @@ export default class UsbGuardPromptPreferences extends ExtensionPreferences {
         this._setStatus(`Changed rule #${ruleId} target to ${newTarget}.`);
     }
 }
-
