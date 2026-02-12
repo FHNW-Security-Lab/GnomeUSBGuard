@@ -682,6 +682,109 @@ class UsbGuardPromptRuntime {
         return [...groupsByRoot.values()].map(group => [...group.values()]);
     }
 
+    _pathDepth(path) {
+        if (!path)
+            return 0;
+        return path.split('.').length;
+    }
+
+    _treePrefix(ancestorHasNext, isLast) {
+        let prefix = '';
+        for (const hasNext of ancestorHasNext)
+            prefix += hasNext ? '|  ' : '   ';
+        return `${prefix}${isLast ? '`- ' : '|- '}`;
+    }
+
+    _isAncestorPath(pathA, pathB) {
+        if (!pathA || !pathB)
+            return false;
+        return pathB.startsWith(`${pathA}.`);
+    }
+
+    _sortTrayTreeNodes(nodes) {
+        nodes.sort((nodeA, nodeB) => {
+            const busA = Number.parseInt(nodeA.bus || '0', 10) || 0;
+            const busB = Number.parseInt(nodeB.bus || '0', 10) || 0;
+            if (busA !== busB)
+                return busA - busB;
+            if (nodeA.path !== nodeB.path)
+                return nodeA.path.localeCompare(nodeB.path);
+            return nodeA.label.localeCompare(nodeB.label);
+        });
+        for (const node of nodes)
+            this._sortTrayTreeNodes(node.children);
+    }
+
+    _buildTrayDeviceTree(groupedDevices) {
+        const nodes = groupedDevices.map(devices => {
+            let primaryPort = {bus: '', path: '', depth: 0};
+            for (const device of devices) {
+                const port = this._splitViaPort(device.viaPort);
+                if (!port.path)
+                    continue;
+                const depth = this._pathDepth(port.path);
+                if (!primaryPort.path || depth < primaryPort.depth ||
+                    (depth === primaryPort.depth && port.path.localeCompare(primaryPort.path) < 0)) {
+                    primaryPort = {bus: port.bus, path: port.path, depth};
+                }
+            }
+
+            return {
+                devices,
+                label: this._buildTrayGroupLabel(devices),
+                hashes: new Set(devices.map(device => device.hash).filter(Boolean)),
+                parentHashes: new Set(devices.map(device => device.parentHash).filter(Boolean)),
+                bus: primaryPort.bus,
+                path: primaryPort.path,
+                depth: primaryPort.depth,
+                parent: null,
+                children: [],
+            };
+        });
+
+        for (const node of nodes) {
+            let bestParent = null;
+            let bestDepth = -1;
+
+            for (const candidate of nodes) {
+                if (candidate === node)
+                    continue;
+                for (const parentHash of node.parentHashes) {
+                    if (candidate.hashes.has(parentHash) && candidate.depth > bestDepth) {
+                        bestParent = candidate;
+                        bestDepth = candidate.depth;
+                    }
+                }
+            }
+
+            if (node.path) {
+                for (const candidate of nodes) {
+                    if (candidate === node || !candidate.path)
+                        continue;
+                    const sameOrUnknownBus = (!node.bus && !candidate.bus) ||
+                        (node.bus && candidate.bus && node.bus === candidate.bus);
+                    if (!sameOrUnknownBus)
+                        continue;
+                    if (!this._isAncestorPath(candidate.path, node.path))
+                        continue;
+                    if (candidate.depth > bestDepth) {
+                        bestParent = candidate;
+                        bestDepth = candidate.depth;
+                    }
+                }
+            }
+
+            if (bestParent) {
+                node.parent = bestParent;
+                bestParent.children.push(node);
+            }
+        }
+
+        const roots = nodes.filter(node => !node.parent);
+        this._sortTrayTreeNodes(roots);
+        return roots;
+    }
+
     _selectedActionForGroup(devices, permanentTargetByIdentity) {
         if (devices.length === 0)
             return null;
@@ -753,6 +856,34 @@ class UsbGuardPromptRuntime {
         return `${label} (+${devices.length - 1})`;
     }
 
+    _createTrayPolicySubMenu(label, devices, permanentTargetByIdentity) {
+        const subMenu = new PopupMenu.PopupSubMenuMenuItem(label);
+        const selectedAction = this._selectedActionForGroup(devices, permanentTargetByIdentity);
+        const addAction = (actionLabel, target, permanent, actionKey) => {
+            const actionItem = new PopupMenu.PopupMenuItem(actionLabel);
+            if (selectedAction === actionKey && typeof actionItem.setOrnament === 'function')
+                actionItem.setOrnament(PopupMenu.Ornament.CHECK);
+            actionItem.connect('activate', () => {
+                void (async () => {
+                    await this._applyPolicyToDeviceGroup(devices, target, permanent);
+                    await this._refreshTrayMenu();
+                })();
+            });
+            subMenu.menu.addMenuItem(actionItem);
+        };
+
+        addAction('Allow once', PolicyTarget.ALLOW, false, 'allow_once');
+        addAction('Allow permanent', PolicyTarget.ALLOW, true, 'allow_permanent');
+        addAction('Block once', PolicyTarget.BLOCK, false, 'block_once');
+        addAction('Block permanent', PolicyTarget.BLOCK, true, 'block_permanent');
+        return subMenu;
+    }
+
+    _addTraySeparator(count = 1) {
+        for (let i = 0; i < count; i++)
+            this._trayButton.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+    }
+
     async _refreshTrayMenu() {
         if (!this._trayButton)
             return;
@@ -791,28 +922,28 @@ class UsbGuardPromptRuntime {
             return;
         }
 
-        for (const groupDevices of grouped) {
-            const subMenu = new PopupMenu.PopupSubMenuMenuItem(this._buildTrayGroupLabel(groupDevices));
-            const selectedAction = this._selectedActionForGroup(groupDevices, permanentTargetByIdentity);
-            const addAction = (label, target, permanent, actionKey) => {
-                const actionItem = new PopupMenu.PopupMenuItem(label);
-                if (selectedAction === actionKey && typeof actionItem.setOrnament === 'function')
-                    actionItem.setOrnament(PopupMenu.Ornament.CHECK);
-                actionItem.connect('activate', () => {
-                    void (async () => {
-                        await this._applyPolicyToDeviceGroup(groupDevices, target, permanent);
-                        await this._refreshTrayMenu();
-                    })();
-                });
-                subMenu.menu.addMenuItem(actionItem);
-            };
+        const roots = this._buildTrayDeviceTree(grouped);
+        const renderNode = (node, ancestorHasNext, isLast, isRoot = false) => {
+            const titlePrefix = isRoot ? '' : this._treePrefix(ancestorHasNext, isLast);
+            const item = this._createTrayPolicySubMenu(`${titlePrefix}${node.label}`, node.devices, permanentTargetByIdentity);
+            this._trayButton.menu.addMenuItem(item);
 
-            addAction('Allow once', PolicyTarget.ALLOW, false, 'allow_once');
-            addAction('Allow permanent', PolicyTarget.ALLOW, true, 'allow_permanent');
-            addAction('Block once', PolicyTarget.BLOCK, false, 'block_once');
-            addAction('Block permanent', PolicyTarget.BLOCK, true, 'block_permanent');
+            if (isRoot && node.children.length > 0)
+                this._addTraySeparator(1);
 
-            this._trayButton.menu.addMenuItem(subMenu);
+            const childAncestorHasNext = isRoot ? [] : [...ancestorHasNext, !isLast];
+            for (let index = 0; index < node.children.length; index++) {
+                const child = node.children[index];
+                renderNode(child, childAncestorHasNext, index === node.children.length - 1, false);
+            }
+        };
+
+        for (let rootIndex = 0; rootIndex < roots.length; rootIndex++) {
+            const root = roots[rootIndex];
+            const isLastRoot = rootIndex === roots.length - 1;
+            renderNode(root, [], isLastRoot, true);
+            if (!isLastRoot)
+                this._addTraySeparator(2);
         }
     }
 

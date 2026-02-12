@@ -611,6 +611,126 @@ export default class UsbGuardPromptPreferences extends ExtensionPreferences {
         return null;
     }
 
+    _splitViaPort(viaPort) {
+        if (!viaPort)
+            return {bus: '', path: ''};
+
+        const match = String(viaPort).match(/^(\d+)-(.+)$/);
+        if (!match)
+            return {bus: '', path: String(viaPort)};
+
+        return {
+            bus: match[1],
+            path: match[2],
+        };
+    }
+
+    _pathDepth(path) {
+        if (!path)
+            return 0;
+        return path.split('.').length;
+    }
+
+    _treePrefix(ancestorHasNext, isLast) {
+        let prefix = '';
+        for (const hasNext of ancestorHasNext)
+            prefix += hasNext ? '|  ' : '   ';
+        return `${prefix}${isLast ? '`- ' : '|- '}`;
+    }
+
+    _createTreeSeparatorRow(doubleLine = false) {
+        const row = new Adw.ActionRow({
+            title: doubleLine ? '====================' : '--------------------',
+        });
+        row.activatable = false;
+        return row;
+    }
+
+    _isAncestorPath(pathA, pathB) {
+        if (!pathA || !pathB)
+            return false;
+        return pathB.startsWith(`${pathA}.`);
+    }
+
+    _buildConnectedDeviceTree(visibleDevices) {
+        const nodes = visibleDevices.map(device => {
+            const {parsed} = device;
+            const port = this._splitViaPort(parsed.viaPort);
+            return {
+                device,
+                hash: parsed.hash || '',
+                parentHash: parsed.parentHash || '',
+                bus: port.bus,
+                path: port.path,
+                depth: this._pathDepth(port.path),
+                children: [],
+                parent: null,
+            };
+        });
+
+        const nodeByHash = new Map();
+        for (const node of nodes) {
+            if (node.hash && !nodeByHash.has(node.hash))
+                nodeByHash.set(node.hash, node);
+        }
+
+        for (const node of nodes) {
+            let bestParent = null;
+            let bestDepth = -1;
+
+            if (node.parentHash && nodeByHash.has(node.parentHash)) {
+                const parent = nodeByHash.get(node.parentHash);
+                bestParent = parent;
+                bestDepth = parent.depth;
+            }
+
+            if (!bestParent && node.path) {
+                for (const candidate of nodes) {
+                    if (candidate === node || !candidate.path)
+                        continue;
+                    const sameOrUnknownBus = (!node.bus && !candidate.bus) ||
+                        (node.bus && candidate.bus && node.bus === candidate.bus);
+                    if (!sameOrUnknownBus)
+                        continue;
+                    if (!this._isAncestorPath(candidate.path, node.path))
+                        continue;
+                    if (candidate.depth > bestDepth) {
+                        bestParent = candidate;
+                        bestDepth = candidate.depth;
+                    }
+                }
+            }
+
+            if (bestParent) {
+                node.parent = bestParent;
+                bestParent.children.push(node);
+            }
+        }
+
+        const sortNodes = list => {
+            list.sort((a, b) => {
+                const busA = Number.parseInt(a.bus || '0', 10) || 0;
+                const busB = Number.parseInt(b.bus || '0', 10) || 0;
+                if (busA !== busB)
+                    return busA - busB;
+                if (a.depth !== b.depth)
+                    return a.depth - b.depth;
+                if (a.path !== b.path)
+                    return a.path.localeCompare(b.path);
+
+                const titleA = a.device.parsed.name || a.device.parsed.hash || a.device.parsed.usbId || `${a.device.deviceId}`;
+                const titleB = b.device.parsed.name || b.device.parsed.hash || b.device.parsed.usbId || `${b.device.deviceId}`;
+                return titleA.localeCompare(titleB);
+            });
+            for (const node of list)
+                sortNodes(node.children);
+        };
+
+        const roots = nodes.filter(node => !node.parent);
+        sortNodes(roots);
+        return roots;
+    }
+
     async _setBaselineFromConnectedDevices() {
         const devices = await this._client.listDevices();
         if (devices.length === 0) {
@@ -714,9 +834,14 @@ export default class UsbGuardPromptPreferences extends ExtensionPreferences {
             return;
         }
 
-        for (const device of visibleDevices) {
+        const roots = this._buildConnectedDeviceTree(visibleDevices);
+
+        const renderNode = (node, ancestorHasNext, isLast, isRoot = false) => {
+            const {device} = node;
             const {deviceId, parsed} = device;
-            const title = parsed.name || parsed.hash || parsed.usbId || `Device ${deviceId}`;
+            const baseTitle = parsed.name || parsed.hash || parsed.usbId || `Device ${deviceId}`;
+            const titlePrefix = isRoot ? '' : this._treePrefix(ancestorHasNext, isLast);
+            const title = `${titlePrefix}${baseTitle}`;
             const subtitleParts = [
                 `id=${deviceId}`,
                 `status=${parsed.target}`,
@@ -740,28 +865,28 @@ export default class UsbGuardPromptPreferences extends ExtensionPreferences {
                     label: 'Allow once',
                     run: async () => {
                         await this._client.applyDevicePolicy(deviceId, 'allow', false);
-                        this._setStatus(`Changed ${title} to allow once.`);
+                        this._setStatus(`Changed ${baseTitle} to allow once.`);
                     },
                 },
                 {
                     label: 'Allow always',
                     run: async () => {
                         await this._client.applyDevicePolicy(deviceId, 'allow', true);
-                        this._setStatus(`Changed ${title} to allow permanent.`);
+                        this._setStatus(`Changed ${baseTitle} to allow permanent.`);
                     },
                 },
                 {
                     label: 'Block once',
                     run: async () => {
                         await this._client.applyDevicePolicy(deviceId, 'block', false);
-                        this._setStatus(`Changed ${title} to block once.`);
+                        this._setStatus(`Changed ${baseTitle} to block once.`);
                     },
                 },
                 {
                     label: 'Block permanent',
                     run: async () => {
                         await this._client.applyDevicePolicy(deviceId, 'block', true);
-                        this._setStatus(`Changed ${title} to block permanent.`);
+                        this._setStatus(`Changed ${baseTitle} to block permanent.`);
                     },
                 },
             ];
@@ -770,6 +895,30 @@ export default class UsbGuardPromptPreferences extends ExtensionPreferences {
 
             this._devicesGroup.add(row);
             this._deviceRows.push(row);
+
+            if (isRoot && node.children.length > 0) {
+                const separator = this._createTreeSeparatorRow(false);
+                this._devicesGroup.add(separator);
+                this._deviceRows.push(separator);
+            }
+
+            const childAncestorHasNext = isRoot ? [] : [...ancestorHasNext, !isLast];
+            for (let index = 0; index < node.children.length; index++) {
+                const child = node.children[index];
+                renderNode(child, childAncestorHasNext, index === node.children.length - 1, false);
+            }
+        };
+
+        for (let rootIndex = 0; rootIndex < roots.length; rootIndex++) {
+            const root = roots[rootIndex];
+            const isLastRoot = rootIndex === roots.length - 1;
+            renderNode(root, [], isLastRoot, true);
+
+            if (!isLastRoot) {
+                const doubleSeparator = this._createTreeSeparatorRow(true);
+                this._devicesGroup.add(doubleSeparator);
+                this._deviceRows.push(doubleSeparator);
+            }
         }
     }
 
