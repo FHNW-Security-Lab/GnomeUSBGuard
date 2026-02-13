@@ -638,14 +638,6 @@ export default class UsbGuardPromptPreferences extends ExtensionPreferences {
         return `${prefix}${isLast ? '`- ' : '|- '}`;
     }
 
-    _createTreeSeparatorRow(doubleLine = false) {
-        const row = new Adw.ActionRow({
-            title: doubleLine ? '====================' : '--------------------',
-        });
-        row.activatable = false;
-        return row;
-    }
-
     _isAncestorPath(pathA, pathB) {
         if (!pathA || !pathB)
             return false;
@@ -896,12 +888,6 @@ export default class UsbGuardPromptPreferences extends ExtensionPreferences {
             this._devicesGroup.add(row);
             this._deviceRows.push(row);
 
-            if (isRoot && node.children.length > 0) {
-                const separator = this._createTreeSeparatorRow(false);
-                this._devicesGroup.add(separator);
-                this._deviceRows.push(separator);
-            }
-
             const childAncestorHasNext = isRoot ? [] : [...ancestorHasNext, !isLast];
             for (let index = 0; index < node.children.length; index++) {
                 const child = node.children[index];
@@ -914,11 +900,6 @@ export default class UsbGuardPromptPreferences extends ExtensionPreferences {
             const isLastRoot = rootIndex === roots.length - 1;
             renderNode(root, [], isLastRoot, true);
 
-            if (!isLastRoot) {
-                const doubleSeparator = this._createTreeSeparatorRow(true);
-                this._devicesGroup.add(doubleSeparator);
-                this._deviceRows.push(doubleSeparator);
-            }
         }
     }
 
