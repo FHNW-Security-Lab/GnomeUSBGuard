@@ -1720,8 +1720,16 @@ class UsbGuardPromptRuntime {
         this._pendingDecisionGroups.delete(context.groupKey);
         const devices = [...context.devicesByHash.values()];
         const ok = await this._applyDecision(devices, target, permanent);
-        if (ok)
+        if (ok) {
+            const connectedDevices = await this._syncDecisionContextWithConnectedDevices(context);
+            await this._applyDecisionToConnectedInfrastructureChildren(
+                context,
+                target,
+                permanent,
+                connectedDevices
+            );
             this._rememberRecentHubDecision(context, target, permanent);
+        }
     }
 
     async _handleInsertWhileLocked(device) {
@@ -1760,6 +1768,77 @@ class UsbGuardPromptRuntime {
         const moreCount = Math.max(0, devices.length - 3);
         const suffix = moreCount > 0 ? ` (+${moreCount} more)` : '';
         return `${preview}${suffix}\nChoose how these devices should be handled.`;
+    }
+
+    _targetNameFromPolicyTarget(target) {
+        return target === PolicyTarget.BLOCK ? 'block' : 'allow';
+    }
+
+    async _syncDecisionContextWithConnectedDevices(context) {
+        let connectedDevices;
+        try {
+            connectedDevices = await this._listConnectedDevices();
+        } catch (error) {
+            logException(error, 'Failed to list connected devices for decision context sync');
+            return null;
+        }
+
+        const byHash = new Map();
+        const byId = new Map();
+        for (const device of connectedDevices) {
+            if (device.hash)
+                byHash.set(device.hash, device);
+            byId.set(device.id, device);
+        }
+
+        for (const [hash, existing] of context.devicesByHash.entries()) {
+            const updated = (hash && byHash.get(hash)) || byId.get(existing.id) || null;
+            if (updated)
+                context.devicesByHash.set(hash, updated);
+        }
+
+        return connectedDevices;
+    }
+
+    async _applyDecisionToConnectedInfrastructureChildren(context, target, permanent, connectedDevices) {
+        if (!Array.isArray(connectedDevices) || connectedDevices.length === 0)
+            return;
+
+        const desiredTarget = this._targetNameFromPolicyTarget(target);
+        const failures = [];
+
+        for (const device of connectedDevices) {
+            if (context.devicesByHash.has(device.hash))
+                continue;
+            if (!this._looksLikeDockInfrastructureDevice(device))
+                continue;
+            if (!this._shouldMergeAsImmediateInfrastructureChild(device, context.devicesByHash))
+                continue;
+
+            const currentTarget = this._normalizeTargetName(device.target);
+            if (currentTarget === desiredTarget) {
+                context.devicesByHash.set(device.hash, device);
+                continue;
+            }
+
+            try {
+                await this._applyDevicePolicy(device.id, target, permanent);
+                context.devicesByHash.set(device.hash, {
+                    ...device,
+                    target: desiredTarget,
+                });
+            } catch (error) {
+                failures.push(device.name);
+                logException(error, `Failed follow-up policy update for ${device.name}`);
+            }
+        }
+
+        if (failures.length > 0) {
+            Main.notifyError(
+                'USBGuard policy update failed',
+                `Could not update: ${failures.join(', ')}`
+            );
+        }
     }
 
     async _applyDecision(devices, target, permanent) {
