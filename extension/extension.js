@@ -928,9 +928,6 @@ class UsbGuardPromptRuntime {
             const item = this._createTrayPolicySubMenu(`${titlePrefix}${node.label}`, node.devices, permanentTargetByIdentity);
             this._trayButton.menu.addMenuItem(item);
 
-            if (isRoot && node.children.length > 0)
-                this._addTraySeparator(1);
-
             const childAncestorHasNext = isRoot ? [] : [...ancestorHasNext, !isLast];
             for (let index = 0; index < node.children.length; index++) {
                 const child = node.children[index];
@@ -943,7 +940,7 @@ class UsbGuardPromptRuntime {
             const isLastRoot = rootIndex === roots.length - 1;
             renderNode(root, [], isLastRoot, true);
             if (!isLastRoot)
-                this._addTraySeparator(2);
+                this._addTraySeparator(1);
         }
     }
 
