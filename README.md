@@ -1,134 +1,184 @@
-# GNOME USBGuard Prompt Extension (GNOME 49)
+# GnomeUSBGuard
 
-This repository contains a GNOME Shell extension that listens to USBGuard over
-system D-Bus and prompts when USB devices are inserted.
+GNOME Shell extension for USBGuard that gives interactive USB authorization with
+good hub behavior and practical policy management.
 
-Each prompt provides:
+Supported GNOME Shell version: `49`  
+Extension UUID: `usbguard-prompt@blacksheeep`
 
-- `Block once`
+## What It Does
+
+The extension listens to USBGuard D-Bus events and lets you decide how newly
+connected USB devices are handled.
+
+Decisions map to USBGuard policy actions:
+
 - `Allow once`
-- `Allow always`
+- `Allow permanent`
+- `Block once`
+- `Block permanent`
 
-The action buttons map to `org.usbguard.Devices.applyDevicePolicy(...)`.
+It supports both USBGuard D-Bus variants:
 
-## Behavior
+- `org.usbguard1` (newer)
+- `org.usbguard` (legacy)
 
-- The extension subscribes to `DevicePresenceChanged` on `org.usbguard.Devices`.
-- It auto-detects both USBGuard D-Bus variants (`org.usbguard1` and legacy
-  `org.usbguard`).
-- It only reacts to `Insert` events.
-- For hubs, notifications are de-duplicated so a single hub insertion does not
-  flood you with many prompts.
-- Companion USB2/USB3 function devices from one physical plug event (for
-  example hub + card reader functions) are grouped into one prompt burst.
-- Grouping is topology-aware and time-window based: the extension merges devices
-  from the same short-lived physical insertion subtree (same or ancestor/child
-  `via-port` path, or parent relationship) into one prompt.
-- Later devices added to the same hub are prompted again as separate events.
-- Duplicate insert suppression is scoped to the same device and same port, so
-  reinserting into a different port is prompted again.
-- While a prompt is still open, same-port companion events in a short merge
-  window are folded into that prompt instead of creating a second one.
-- Devices connected through the hub later are prompted again as separate
-  devices.
-- If the screen is locked, newly inserted devices are immediately **blocked once**
-  and queued; after unlock, you get approval prompts for those queued devices.
+## Feature List
 
-## Project Layout
+- Real-time USB insertion handling from USBGuard D-Bus (`DevicePresenceChanged`)
+- Actionable GNOME notifications with allow/block choices
+- Optional tray icon workflow with per-device/group quick actions
+- Optional "tray only" mode (disable notifications while tray icon is enabled)
+- Topology-aware grouping to reduce prompt spam for multi-function USB-C hubs
+- Controlled merge behavior for hub infrastructure (hubs/billboard and related
+  internal functions), while keeping standalone endpoints separate
+- Late child inheritance: devices that enumerate shortly after hub allow can
+  inherit the same decision automatically
+- Cross-port separation: same hardware on different host ports is treated as a
+  separate context
+- Duplicate insert suppression for repeated near-identical insert signals
+- Lock-screen behavior: newly inserted devices are blocked once while locked and
+  queued for handling after unlock
+- Preferences UI with connected devices, permanent rules, and System-Devices
+  sections
+- Per-device policy changes from preferences and tray menu
+- System-Devices baseline workflow
+- Nix flake support for dev, install, packaging, and reproducible release zip
 
-- `extension/metadata.json`: GNOME extension metadata (`shell-version = 49`)
-- `extension/extension.js`: USBGuard D-Bus listener + notification actions
-- `extension/prefs.js`: Preferences UI for editing/removing device rules
-- `flake.nix`: Nix flake (package + dev shell + install app)
-- `scripts/install-extension.sh`: local install helper
+## How To Operate
 
-## Nix / Build
+## Runtime Flow
 
-Build package:
+1. Plug in a new USB device.
+2. Approve/deny via notification or tray menu.
+3. Use permanent actions for trusted hardware you do not want to re-approve.
+
+## Tray Menu
+
+- Shows non-System device groups with topology tree rendering.
+- Each group has actions:
+  - `Allow once`
+  - `Allow permanent`
+  - `Block once`
+  - `Block permanent`
+- Selected state is shown with a checkmark when group state is consistent.
+
+## Preferences (`gnome-extensions prefs usbguard-prompt@blacksheeep`)
+
+- `Connected Devices`: currently active non-permanent devices, current status,
+  quick change actions.
+- `Permanent Rules`: current persistent USBGuard rules, with change/remove.
+- `System-Devices`: trusted baseline category with same management controls.
+- `Set baseline`: marks currently connected devices as System-Devices and
+  applies permanent allow.
+- Tray settings:
+  - enable/disable tray icon
+  - optionally disable notifications when tray icon is enabled
+
+## Install
+
+## Prerequisites
+
+- GNOME Shell `49`
+- USBGuard service running with D-Bus enabled
+- User authorized to call USBGuard policy methods
+
+## Quick Install From Repo
+
+```bash
+./scripts/install-extension.sh
+gnome-extensions enable usbguard-prompt@blacksheeep
+```
+
+## Install With Nix Flake App
+
+```bash
+nix run "path:$PWD#install"
+gnome-extensions enable usbguard-prompt@blacksheeep
+```
+
+If GNOME Shell does not pick up changes immediately, restart GNOME Shell or
+log out/in.
+
+## NixOS USBGuard Example
+
+```nix
+services.usbguard = {
+  enable = true;
+  dbus.enable = true;
+
+  presentDevicePolicy = "allow";
+  insertedDevicePolicy = "apply-policy";
+
+  IPCAllowedUsers = [ "root" "your-user" ];
+  IPCAllowedGroups = [ "wheel" ];
+
+  rules = null;
+  ruleFile = "/var/lib/usbguard/rules.conf";
+};
+```
+
+Notes:
+
+- `presentDevicePolicy = "allow"` keeps devices already connected at startup
+  usable.
+- `insertedDevicePolicy = "apply-policy"` means new inserts require matching
+  rules or interactive decisions.
+- This extension does not hardcode immutable USBGuard rules. It manages policy
+  through USBGuard APIs and your rule file.
+
+## Build And Release
+
+## Build Extension Package
 
 ```bash
 nix build "path:$PWD#default"
 ```
 
-Build a clean extension release zip (dependency-resolved via Nix, output in `build/`):
+This builds an installable extension derivation into the Nix store.
+
+## Build Release Zip
 
 ```bash
 nix run "path:$PWD#release-zip"
 ```
 
-This command:
+What this does:
 
-- resolves required tools through Nix (`gnome-extensions`, `jq`, `zip`, etc.)
-- builds a release zip in `build/` named `<uuid>-v<metadata.version>.zip`
-- removes older zip files for the same extension UUID in `build/`
-- uses temporary directories and cleans them on exit (no leftover temp artifacts)
+- resolves packaging dependencies via Nix
+- packages extension files from `extension/`
+- writes release zip to `build/<uuid>-v<metadata.version>.zip`
+- removes older zip files for the same UUID in `build/`
+- uses temporary directories and cleans up automatically
 
-For local development/install, existing flake targets are unchanged (`#default`, `#install`).
+This zip is suitable for GNOME extension distribution workflows.
 
-Enter development shell:
+## Development
+
+Enter dev shell:
 
 ```bash
 nix develop "path:$PWD"
 ```
 
-## Install
-
-Install from repo checkout:
-
-```bash
-./scripts/install-extension.sh
-```
-
-Or install from flake source:
-
-```bash
-nix run "path:$PWD#install"
-```
-
-Enable extension:
-
-```bash
-gnome-extensions enable usbguard-prompt@blacksheeep
-```
-
-On Wayland, log out and back in if GNOME Shell does not pick up the extension
-immediately.
-
-Open preferences UI:
+Useful commands:
 
 ```bash
 gnome-extensions prefs usbguard-prompt@blacksheeep
-```
-
-In preferences you can:
-
-- change policy for connected devices (`Allow once`, `Allow always`, `Block once`, `Block permanent`)
-- reset matching permanent rules for a device (`Reset rules`)
-- edit permanent rules (`Allow`, `Block`, `Reject`)
-- delete permanent rules
-
-## NixOS Notes
-
-1. Enable USBGuard (`services.usbguard.enable = true;`).
-2. Ensure your desktop user is authorized to call USBGuard D-Bus policy
-   methods, otherwise actions may fail with permission errors.
-3. Set your USBGuard default policy to block/reject unknown devices if you want
-   explicit prompts for every new insertion.
-
-## Debugging
-
-Follow shell logs:
-
-```bash
 journalctl --user -f | rg usbguard-prompt
 ```
 
-Manual D-Bus sanity check:
+## Project Structure
 
-```bash
-busctl --system call org.usbguard /org/usbguard org.usbguard.Devices listDevices s "match"
-```
+- `extension/extension.js`: runtime logic (D-Bus events, prompt/tray actions,
+  grouping, policy application)
+- `extension/prefs.js`: preferences UI and policy/rule management
+- `extension/metadata.json`: extension metadata
+- `scripts/install-extension.sh`: local installer
+- `scripts/release-zip.sh`: release zip builder
+- `flake.nix`: Nix flake outputs (`default`, `install`, `release-zip`, dev
+  shell)
 
 ## License
 
-This project is licensed under GNU GPL v3.0 (`GPL-3.0-only`).
+GNU GPL v3.0 (`GPL-3.0-only`)
