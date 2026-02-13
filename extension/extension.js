@@ -1192,14 +1192,11 @@ class UsbGuardPromptRuntime {
             return true;
 
         const name = String(device.name ?? '').toLowerCase();
-        if (name.includes('card reader') || name.includes('billboard'))
+        if (name.includes('billboard'))
             return true;
 
         const interfaceClasses = this._extractInterfaceClasses(device);
         if (interfaceClasses.has('09') || interfaceClasses.has('11'))
-            return true;
-
-        if (interfaceClasses.has('08') && name.includes('card reader'))
             return true;
 
         return false;
