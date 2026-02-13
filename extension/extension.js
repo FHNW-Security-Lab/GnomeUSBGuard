@@ -37,6 +37,7 @@ const BURST_MAX_WINDOW_MS = 12000;
 const PENDING_DECISION_MERGE_WINDOW_MS = 15000;
 const POST_DECISION_ENUM_WINDOW_MS = 12000;
 const IMMEDIATE_ENUM_FALLBACK_MS = POST_DECISION_ENUM_WINDOW_MS;
+const TRAY_ACTION_FOLLOWUP_REFRESH_MS = 1200;
 const DUPLICATE_INSERT_SUPPRESS_USEC = 900 * 1000;
 const DBUS_CALL_TIMEOUT_MS = 2500;
 const SETTINGS_POLL_MS = 2000;
@@ -103,6 +104,7 @@ class UsbGuardPromptRuntime {
         this._trayEnabled = false;
         this._suppressPromptsWhenTrayEnabled = false;
         this._traySettingsPollId = 0;
+        this._trayActionRefreshId = 0;
         this._trayButton = null;
         this._permanentTargetByIdentity = new Map();
         this._permanentRuleCacheUpdatedAtUsec = 0;
@@ -301,11 +303,34 @@ class UsbGuardPromptRuntime {
     }
 
     _destroyTrayButton() {
+        if (this._trayActionRefreshId > 0) {
+            GLib.source_remove(this._trayActionRefreshId);
+            this._trayActionRefreshId = 0;
+        }
+
         if (!this._trayButton)
             return;
 
         this._trayButton.destroy();
         this._trayButton = null;
+    }
+
+    _scheduleTrayFollowupRefresh(delayMs = TRAY_ACTION_FOLLOWUP_REFRESH_MS) {
+        if (this._trayActionRefreshId > 0) {
+            GLib.source_remove(this._trayActionRefreshId);
+            this._trayActionRefreshId = 0;
+        }
+
+        this._trayActionRefreshId = GLib.timeout_add(
+            GLib.PRIORITY_DEFAULT,
+            delayMs,
+            () => {
+                this._trayActionRefreshId = 0;
+                if (this._trayButton)
+                    void this._refreshTrayMenu();
+                return GLib.SOURCE_REMOVE;
+            }
+        );
     }
 
     _extractRuleField(ruleText, fieldName) {
@@ -868,6 +893,7 @@ class UsbGuardPromptRuntime {
                 void (async () => {
                     await this._applyPolicyToDeviceGroup(devices, target, permanent);
                     await this._refreshTrayMenu();
+                    this._scheduleTrayFollowupRefresh();
                 })();
             });
             subMenu.menu.addMenuItem(actionItem);
