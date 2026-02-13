@@ -36,6 +36,7 @@ const DEVICE_PROMPT_DEBOUNCE_MS = 1200;
 const BURST_MAX_WINDOW_MS = 12000;
 const PENDING_DECISION_MERGE_WINDOW_MS = 15000;
 const POST_DECISION_ENUM_WINDOW_MS = 12000;
+const IMMEDIATE_ENUM_FALLBACK_MS = 5000;
 const DUPLICATE_INSERT_SUPPRESS_USEC = 900 * 1000;
 const DBUS_CALL_TIMEOUT_MS = 2500;
 const SETTINGS_POLL_MS = 2000;
@@ -1373,6 +1374,30 @@ class UsbGuardPromptRuntime {
         return false;
     }
 
+    _topologyRootPath(viaPort) {
+        const {path} = this._splitViaPort(viaPort);
+        if (!path)
+            return '';
+        const [root] = path.split('.');
+        return root || '';
+    }
+
+    _sharesHubTopologyRoot(device, devicesByHash) {
+        const deviceRoot = this._topologyRootPath(device.viaPort);
+        if (!deviceRoot)
+            return false;
+
+        for (const existing of devicesByHash.values()) {
+            if (!existing.isHub)
+                continue;
+            const existingRoot = this._topologyRootPath(existing.viaPort);
+            if (existingRoot && existingRoot === deviceRoot)
+                return true;
+        }
+
+        return false;
+    }
+
     _groupKeyForDevice(device) {
         // Keep bus-specific via-port as key so identical hubs on different
         // host ports never collapse into one decision context.
@@ -1399,7 +1424,10 @@ class UsbGuardPromptRuntime {
         if (!this._looksLikeDockInfrastructureDevice(device))
             return false;
 
-        return this._isImmediateEnumerationChild(device, devicesByHash);
+        if (this._isImmediateEnumerationChild(device, devicesByHash))
+            return true;
+
+        return this._sharesHubTopologyRoot(device, devicesByHash);
     }
 
     _shouldMergeIntoPendingContext(device, context) {
@@ -1441,10 +1469,17 @@ class UsbGuardPromptRuntime {
 
         for (const [key, decision] of this._recentHubDecisions.entries()) {
             const directMerge = this._shouldMergeWithDevices(device, decision.devicesByHash);
-            const immediateInfrastructureChild = this._shouldMergeAsImmediateInfrastructureChild(
+            let immediateInfrastructureChild = this._shouldMergeAsImmediateInfrastructureChild(
                 device,
                 decision.devicesByHash
             );
+            if (immediateInfrastructureChild) {
+                const ageUsec = now - (decision.createdAtUsec ?? now);
+                if (ageUsec > IMMEDIATE_ENUM_FALLBACK_MS * 1000 &&
+                    !this._isImmediateEnumerationChild(device, decision.devicesByHash)) {
+                    immediateInfrastructureChild = false;
+                }
+            }
             if (!directMerge && !immediateInfrastructureChild)
                 continue;
 
@@ -1465,6 +1500,7 @@ class UsbGuardPromptRuntime {
             target,
             permanent,
             expiresAtUsec: now + POST_DECISION_ENUM_WINDOW_MS * 1000,
+            createdAtUsec: now,
             devicesByHash: new Map(context.devicesByHash),
         });
     }
