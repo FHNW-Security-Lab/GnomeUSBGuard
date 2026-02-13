@@ -869,6 +869,16 @@ class UsbGuardPromptRuntime {
             return;
         }
 
+        const context = this._buildDecisionContextFromDevices(devices);
+        const connectedDevices = await this._syncDecisionContextWithConnectedDevices(context);
+        await this._applyDecisionToConnectedInfrastructureChildren(
+            context,
+            target,
+            permanent,
+            connectedDevices
+        );
+        this._rememberRecentHubDecision(context, target, permanent);
+
         Main.notify('USBGuard', `Updated ${devices.length} device(s).`);
     }
 
@@ -992,9 +1002,6 @@ class UsbGuardPromptRuntime {
             return;
         }
 
-        if (this._shouldSuppressPrompts())
-            return;
-
         const groupKey = this._groupKeyForDevice(device);
         const pendingDecision = this._findPendingDecisionContext(device, groupKey);
         if (pendingDecision) {
@@ -1007,6 +1014,9 @@ class UsbGuardPromptRuntime {
             void this._applyRecentHubDecision(device, groupKey, recentHubDecision);
             return;
         }
+
+        if (this._shouldSuppressPrompts())
+            return;
 
         this._queuePrompt(device, groupKey);
     }
@@ -1772,6 +1782,20 @@ class UsbGuardPromptRuntime {
 
     _targetNameFromPolicyTarget(target) {
         return target === PolicyTarget.BLOCK ? 'block' : 'allow';
+    }
+
+    _buildDecisionContextFromDevices(devices) {
+        const devicesByHash = new Map();
+        for (const device of devices)
+            devicesByHash.set(device.hash, device);
+
+        const firstDevice = devices[0] ?? null;
+        return {
+            groupKey: firstDevice ? this._groupKeyForDevice(firstDevice) : `group:${GLib.get_monotonic_time()}`,
+            devicesByHash,
+            createdAtUsec: GLib.get_monotonic_time(),
+            resolved: true,
+        };
     }
 
     async _syncDecisionContextWithConnectedDevices(context) {
