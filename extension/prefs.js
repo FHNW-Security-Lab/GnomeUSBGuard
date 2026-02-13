@@ -43,12 +43,38 @@ function extractQuotedField(ruleText, fieldName) {
     return match ? match[1] : '';
 }
 
+function decodeUsbguardEscapedText(value) {
+    const text = String(value ?? '');
+    if (!text.includes('\\x'))
+        return text;
+
+    const bytes = [];
+    const encoder = new TextEncoder();
+    for (let index = 0; index < text.length; index++) {
+        if (text[index] === '\\' && text[index + 1] === 'x') {
+            const hex = text.slice(index + 2, index + 4);
+            if (/^[0-9a-fA-F]{2}$/.test(hex)) {
+                bytes.push(Number.parseInt(hex, 16));
+                index += 3;
+                continue;
+            }
+        }
+        bytes.push(...encoder.encode(text[index]));
+    }
+
+    try {
+        return new TextDecoder('utf-8').decode(Uint8Array.from(bytes));
+    } catch (error) {
+        return text;
+    }
+}
+
 function parseRuleText(ruleText) {
     const rawText = String(ruleText ?? '');
     const targetMatch = rawText.trim().match(/^(allow|block|reject)\b/i);
 
     const target = targetMatch ? targetMatch[1].toLowerCase() : 'unknown';
-    const name = extractQuotedField(rawText, 'name');
+    const name = decodeUsbguardEscapedText(extractQuotedField(rawText, 'name'));
     const hash = extractQuotedField(rawText, 'hash');
     const parentHash = extractQuotedField(rawText, 'parent-hash');
     const serial = extractQuotedField(rawText, 'serial');

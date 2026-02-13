@@ -333,6 +333,32 @@ class UsbGuardPromptRuntime {
         );
     }
 
+    _decodeUsbguardEscapedText(value) {
+        const text = String(value ?? '');
+        if (!text.includes('\\x'))
+            return text;
+
+        const bytes = [];
+        const encoder = new TextEncoder();
+        for (let index = 0; index < text.length; index++) {
+            if (text[index] === '\\' && text[index + 1] === 'x') {
+                const hex = text.slice(index + 2, index + 4);
+                if (/^[0-9a-fA-F]{2}$/.test(hex)) {
+                    bytes.push(Number.parseInt(hex, 16));
+                    index += 3;
+                    continue;
+                }
+            }
+            bytes.push(...encoder.encode(text[index]));
+        }
+
+        try {
+            return new TextDecoder('utf-8').decode(Uint8Array.from(bytes));
+        } catch (error) {
+            return text;
+        }
+    }
+
     _extractRuleField(ruleText, fieldName) {
         if (typeof ruleText !== 'string')
             return '';
@@ -357,7 +383,8 @@ class UsbGuardPromptRuntime {
     }
 
     _buildDeviceContextFromListedRule(deviceId, deviceRule) {
-        const name = this._extractRuleField(deviceRule, 'name') || `Device ${deviceId}`;
+        const rawName = this._extractRuleField(deviceRule, 'name') || `Device ${deviceId}`;
+        const name = this._decodeUsbguardEscapedText(rawName);
         const hash = this._extractRuleField(deviceRule, 'hash') || `id-${deviceId}`;
         const parentHash = this._extractRuleField(deviceRule, 'parent-hash');
         const viaPort = this._extractRuleField(deviceRule, 'via-port');
@@ -1176,7 +1203,8 @@ class UsbGuardPromptRuntime {
 
     _buildDeviceContext(id, deviceRule, attributes) {
         const attrs = attributes ?? {};
-        const deviceName = attrs.name?.trim() || this._extractNameFromRule(deviceRule) || 'Unknown USB device';
+        const rawDeviceName = attrs.name?.trim() || this._extractNameFromRule(deviceRule) || 'Unknown USB device';
+        const deviceName = this._decodeUsbguardEscapedText(rawDeviceName);
         const hash = attrs.hash?.trim() || `id-${id}`;
         const parentHash = attrs['parent-hash']?.trim() || '';
         const interfaceDescriptor = attrs['with-interface']?.trim() || '';
