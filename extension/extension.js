@@ -1398,8 +1398,16 @@ class UsbGuardPromptRuntime {
         return nowUsec - context.createdAtUsec <= PENDING_DECISION_MERGE_WINDOW_MS * 1000;
     }
 
+    _shouldMergeAsImmediateInfrastructureChild(device, devicesByHash) {
+        if (!this._looksLikeDockInfrastructureDevice(device))
+            return false;
+
+        return this._isImmediateEnumerationChild(device, devicesByHash);
+    }
+
     _shouldMergeIntoPendingContext(device, context) {
-        return this._shouldMergeWithDevices(device, context.devicesByHash);
+        return this._shouldMergeWithDevices(device, context.devicesByHash) ||
+            this._shouldMergeAsImmediateInfrastructureChild(device, context.devicesByHash);
     }
 
     _findPendingDecisionContext(device, groupKey) {
@@ -1435,10 +1443,12 @@ class UsbGuardPromptRuntime {
         this._pruneRecentHubDecisions(now);
 
         for (const [key, decision] of this._recentHubDecisions.entries()) {
-            if (!this._shouldMergeWithDevices(device, decision.devicesByHash))
-                continue;
-
-            if (!this._isImmediateEnumerationChild(device, decision.devicesByHash))
+            const directMerge = this._shouldMergeWithDevices(device, decision.devicesByHash);
+            const immediateInfrastructureChild = this._shouldMergeAsImmediateInfrastructureChild(
+                device,
+                decision.devicesByHash
+            );
+            if (!directMerge && !immediateInfrastructureChild)
                 continue;
 
             return [key, decision];
