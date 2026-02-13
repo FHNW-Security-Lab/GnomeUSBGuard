@@ -1533,10 +1533,15 @@ class UsbGuardPromptRuntime {
 
     async _applyRecentHubDecision(device, groupKey, recentHubDecision) {
         const [decisionKey, decision] = recentHubDecision;
+        const hadDeviceAlready = decision.devicesByHash.has(device.hash);
+        if (!hadDeviceAlready)
+            decision.devicesByHash.set(device.hash, device);
+
         try {
             await this._applyDevicePolicy(device.id, decision.target, decision.permanent);
-            decision.devicesByHash.set(device.hash, device);
         } catch (error) {
+            if (!hadDeviceAlready)
+                decision.devicesByHash.delete(device.hash);
             this._recentHubDecisions.delete(decisionKey);
             logException(error, `Failed to auto-apply recent hub decision for ${device.name}`);
             this._queuePrompt(device, groupKey);
