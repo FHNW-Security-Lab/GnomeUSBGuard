@@ -442,10 +442,10 @@ class UsbGuardPromptRuntime {
 
         if (hash)
             add(`hash:${hash}`);
-        if (serial && usbId)
-            add(`id-serial:${usbId}|${serial}`);
         if (usbId && viaPort)
             add(`id-port:${usbId}|${viaPort}`);
+        if (serial && usbId)
+            add(`id-serial:${usbId}|${serial}`);
 
         const normalizedRule = rule
             .replace(/^\s*(allow|block|reject)\b/i, '')
@@ -556,6 +556,8 @@ class UsbGuardPromptRuntime {
                     continue;
                 for (const ruleId of ids)
                     ruleIds.add(ruleId);
+                // Use the most specific matching identity key only.
+                break;
             }
         }
         return [...ruleIds];
