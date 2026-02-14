@@ -439,22 +439,35 @@ class UsbGuardPromptRuntime {
         const usbId = String(identityCarrier.usbId ?? '').trim().toLowerCase();
         const viaPort = String(identityCarrier.viaPort ?? '').trim();
         const rule = String(identityCarrier.rule ?? '');
+        const hasStrongSerial = serial && usbId && !this._isWeakSerial(serial);
+        const hasStrongTopologyIdentity = Boolean(hash || viaPort);
 
         if (hash)
             add(`hash:${hash}`);
         if (usbId && viaPort)
             add(`id-port:${usbId}|${viaPort}`);
-        if (serial && usbId)
+        if (hasStrongSerial)
             add(`id-serial:${usbId}|${serial}`);
 
         const normalizedRule = rule
             .replace(/^\s*(allow|block|reject)\b/i, '')
             .replace(/\s+/g, ' ')
             .trim();
-        if (normalizedRule)
+        if (normalizedRule && (hasStrongTopologyIdentity || hasStrongSerial))
             add(`rule:${normalizedRule}`);
 
         return candidates;
+    }
+
+    _isWeakSerial(serial) {
+        const value = String(serial ?? '').trim().toLowerCase();
+        if (!value)
+            return true;
+        if (/^0+$/.test(value))
+            return true;
+        if (value === 'unknown' || value === 'none' || value === 'n/a')
+            return true;
+        return false;
     }
 
     _normalizeTargetName(targetName) {
@@ -529,38 +542,24 @@ class UsbGuardPromptRuntime {
         return targets;
     }
 
-    _buildPermanentRuleIdsByIdentity(rules) {
-        const idsByIdentity = new Map();
-        for (const [ruleId, ruleText] of rules) {
-            const target = this._normalizeTargetName(this._extractRuleTarget(ruleText));
-            if (target === 'unknown')
-                continue;
+    _ruleMatchesDeviceForPermanentRemoval(ruleText, device) {
+        const ruleHash = this._extractRuleField(ruleText, 'hash');
+        if (ruleHash && device.hash)
+            return ruleHash === device.hash;
 
-            const keys = this._buildIdentityCandidatesFromRuleText(ruleText);
-            for (const key of keys) {
-                if (!idsByIdentity.has(key))
-                    idsByIdentity.set(key, new Set());
-                idsByIdentity.get(key).add(ruleId);
-            }
-        }
-        return idsByIdentity;
-    }
+        const ruleViaPort = this._extractRuleField(ruleText, 'via-port');
+        if (ruleViaPort && device.viaPort)
+            return ruleViaPort === device.viaPort;
 
-    _collectPermanentRuleIdsForDevices(devices, idsByIdentity) {
-        const ruleIds = new Set();
-        for (const device of devices) {
-            const keys = this._buildIdentityCandidatesFromDevice(device);
-            for (const key of keys) {
-                const ids = idsByIdentity.get(key);
-                if (!ids)
-                    continue;
-                for (const ruleId of ids)
-                    ruleIds.add(ruleId);
-                // Use the most specific matching identity key only.
-                break;
-            }
-        }
-        return [...ruleIds];
+        const ruleUsbId = this._extractRuleUsbId(ruleText);
+        const ruleSerial = this._extractRuleField(ruleText, 'serial');
+        if (!ruleUsbId || !ruleSerial || !device.usbId || !device.serial)
+            return false;
+        if (this._isWeakSerial(ruleSerial))
+            return false;
+
+        return ruleUsbId === String(device.usbId).toLowerCase() &&
+            ruleSerial === String(device.serial);
     }
 
     async _getPermanentTargetByIdentityMap() {
@@ -639,9 +638,20 @@ class UsbGuardPromptRuntime {
             return false;
         }
 
-        const idsByIdentity = this._buildPermanentRuleIdsByIdentity(rules);
-        const ruleIds = this._collectPermanentRuleIdsForDevices(devices, idsByIdentity);
-        if (ruleIds.length === 0)
+        const ruleIds = new Set();
+        for (const [ruleId, ruleText] of rules) {
+            const target = this._normalizeTargetName(this._extractRuleTarget(ruleText));
+            if (target === 'unknown')
+                continue;
+
+            for (const device of devices) {
+                if (this._ruleMatchesDeviceForPermanentRemoval(ruleText, device)) {
+                    ruleIds.add(ruleId);
+                    break;
+                }
+            }
+        }
+        if (ruleIds.size === 0)
             return true;
 
         const failedRuleIds = [];
