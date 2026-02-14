@@ -444,12 +444,8 @@ class UsbGuardPromptRuntime {
             add(`hash:${hash}`);
         if (serial && usbId)
             add(`id-serial:${usbId}|${serial}`);
-        if (serial)
-            add(`serial:${serial}`);
         if (usbId && viaPort)
             add(`id-port:${usbId}|${viaPort}`);
-        if (usbId)
-            add(`usbid:${usbId}`);
 
         const normalizedRule = rule
             .replace(/^\s*(allow|block|reject)\b/i, '')
