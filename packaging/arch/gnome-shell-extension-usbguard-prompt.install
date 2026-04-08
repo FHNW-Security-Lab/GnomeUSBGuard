@@ -1,0 +1,16 @@
+_uuid='usbguard-prompt@blacksheeep'
+
+post_install() {
+  cat <<EOF
+The extension was installed system-wide.
+
+Log out and back in before enabling it so GNOME Shell rescans system extensions.
+
+Then enable it for your user with:
+  gnome-extensions enable ${_uuid}
+EOF
+}
+
+post_upgrade() {
+  post_install
+}

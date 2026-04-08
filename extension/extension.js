@@ -40,10 +40,17 @@ const IMMEDIATE_ENUM_FALLBACK_MS = POST_DECISION_ENUM_WINDOW_MS;
 const TRAY_ACTION_FOLLOWUP_REFRESH_MS = 1200;
 const DUPLICATE_INSERT_SUPPRESS_USEC = 900 * 1000;
 const DBUS_CALL_TIMEOUT_MS = 2500;
+const DBUS_INTERACTIVE_CALL_TIMEOUT_MS = 60000;
 const SETTINGS_POLL_MS = 2000;
 const PERMANENT_RULE_CACHE_USEC = 3 * 1000 * 1000;
 const SETTINGS_FILENAME = 'settings.json';
 const SYSTEM_DEVICES_FILENAME = 'system-devices.json';
+const USBGUARD_CLI_CANDIDATES = [
+    'usbguard',
+    '/usr/bin/usbguard',
+    '/run/current-system/sw/bin/usbguard',
+    '/run/wrappers/bin/usbguard',
+];
 
 const PolicyTarget = {
     ALLOW: 0,
@@ -56,6 +63,66 @@ function logInfo(message) {
 
 function logException(error, message) {
     logError(error, `[usbguard-prompt] ${message}`);
+}
+
+function isAuthorizationError(error) {
+    const message = error?.message ? String(error.message) : String(error);
+    return /AccessDenied|Not authorized|authorization required|polkit/i.test(message);
+}
+
+let cachedUsbguardCommand = undefined;
+
+function findUsbguardCommand() {
+    if (cachedUsbguardCommand !== undefined)
+        return cachedUsbguardCommand;
+
+    for (const candidate of USBGUARD_CLI_CANDIDATES) {
+        if (candidate.includes('/')) {
+            if (GLib.file_test(candidate, GLib.FileTest.IS_EXECUTABLE)) {
+                cachedUsbguardCommand = candidate;
+                return cachedUsbguardCommand;
+            }
+            continue;
+        }
+
+        const resolved = GLib.find_program_in_path(candidate);
+        if (resolved) {
+            cachedUsbguardCommand = resolved;
+            return cachedUsbguardCommand;
+        }
+    }
+
+    cachedUsbguardCommand = null;
+    return cachedUsbguardCommand;
+}
+
+function runUsbguardCli(args) {
+    const command = findUsbguardCommand();
+    if (!command)
+        return Promise.reject(new Error('usbguard CLI not found'));
+
+    const argv = [command, ...args];
+    const subprocess = Gio.Subprocess.new(
+        argv,
+        Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
+    );
+
+    return new Promise((resolve, reject) => {
+        subprocess.communicate_utf8_async(null, null, (proc, result) => {
+            try {
+                const [, stdout, stderr] = proc.communicate_utf8_finish(result);
+                if (!proc.get_successful()) {
+                    const detail = String(stderr ?? stdout ?? '').trim();
+                    reject(new Error(detail || `usbguard command failed with exit code ${proc.get_exit_status()}`));
+                    return;
+                }
+
+                resolve(String(stdout ?? '').trim());
+            } catch (error) {
+                reject(error);
+            }
+        });
+    });
 }
 
 function createSource() {
@@ -623,6 +690,11 @@ class UsbGuardPromptRuntime {
                 return;
             } catch (error) {
                 lastError = error;
+                if (isAuthorizationError(error)) {
+                    await runUsbguardCli(['remove-rule', String(ruleId)]);
+                    this._invalidatePermanentRuleCache();
+                    return;
+                }
             }
         }
 
@@ -1104,10 +1176,18 @@ class UsbGuardPromptRuntime {
 
     _detectUsbguardBackend() {
         for (const backend of USBGUARD_BACKENDS) {
-            if (this._hasBusOwner(backend.busName))
+            if (this._ensureBusNameAvailable(backend.busName))
                 return backend;
         }
         return null;
+    }
+
+    _ensureBusNameAvailable(busName) {
+        if (this._hasBusOwner(busName))
+            return true;
+        if (!this._isBusNameActivatable(busName))
+            return false;
+        return this._startBusService(busName);
     }
 
     _hasBusOwner(busName) {
@@ -1127,6 +1207,47 @@ class UsbGuardPromptRuntime {
             return Boolean(hasOwner);
         } catch (error) {
             logException(error, `Failed to query D-Bus owner for ${busName}`);
+            return false;
+        }
+    }
+
+    _isBusNameActivatable(busName) {
+        try {
+            const response = this._bus.call_sync(
+                'org.freedesktop.DBus',
+                '/org/freedesktop/DBus',
+                'org.freedesktop.DBus',
+                'ListActivatableNames',
+                null,
+                new GLib.VariantType('(as)'),
+                Gio.DBusCallFlags.NONE,
+                DBUS_CALL_TIMEOUT_MS,
+                null
+            );
+            const [names] = response.deepUnpack();
+            return Array.isArray(names) && names.includes(busName);
+        } catch (error) {
+            logException(error, `Failed to query activatable D-Bus names for ${busName}`);
+            return false;
+        }
+    }
+
+    _startBusService(busName) {
+        try {
+            this._bus.call_sync(
+                'org.freedesktop.DBus',
+                '/org/freedesktop/DBus',
+                'org.freedesktop.DBus',
+                'StartServiceByName',
+                new GLib.Variant('(su)', [busName, 0]),
+                new GLib.VariantType('(u)'),
+                Gio.DBusCallFlags.NONE,
+                DBUS_CALL_TIMEOUT_MS,
+                null
+            );
+            return true;
+        } catch (error) {
+            logException(error, `Failed to start D-Bus service ${busName}`);
             return false;
         }
     }
@@ -1939,13 +2060,41 @@ class UsbGuardPromptRuntime {
                 return;
             } catch (error) {
                 lastError = error;
+                if (isAuthorizationError(error)) {
+                    await this._applyDevicePolicyWithCli(deviceId, target, permanent);
+                    if (permanent)
+                        this._invalidatePermanentRuleCache();
+                    return;
+                }
             }
         }
 
         throw lastError ?? new Error('USBGuard call failed');
     }
 
+    async _applyDevicePolicyWithCli(deviceId, target, permanent) {
+        const targetName = this._targetNameFromPolicyTarget(target);
+        let subcommand = null;
+
+        if (targetName === 'allow')
+            subcommand = 'allow-device';
+        else if (targetName === 'block')
+            subcommand = 'block-device';
+
+        if (!subcommand)
+            throw new Error(`Unsupported USBGuard target "${targetName}"`);
+
+        const args = [subcommand, String(deviceId)];
+        if (permanent)
+            args.push('--permanent');
+
+        await runUsbguardCli(args);
+    }
+
     _callUsbguardMethod(objectPath, methodName, parameters, replyType, interfaceName = null) {
+        const timeoutMs = ['applyDevicePolicy', 'removeRule'].includes(methodName)
+            ? DBUS_INTERACTIVE_CALL_TIMEOUT_MS
+            : DBUS_CALL_TIMEOUT_MS;
         return new Promise((resolve, reject) => {
             this._bus.call(
                 this._usbguardBackend.busName,
@@ -1955,7 +2104,7 @@ class UsbGuardPromptRuntime {
                 parameters,
                 replyType,
                 Gio.DBusCallFlags.NONE,
-                DBUS_CALL_TIMEOUT_MS,
+                timeoutMs,
                 null,
                 (connection, result) => {
                     try {

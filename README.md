@@ -90,6 +90,114 @@ It supports both USBGuard D-Bus variants:
 gnome-extensions enable usbguard-prompt@blacksheeep
 ```
 
+## Install On Arch With `paru`
+
+Install the required packages first:
+
+```bash
+sudo pacman -S --needed base-devel gnome-shell usbguard
+```
+
+Notes:
+
+- The `paru -Bi ...` command below assumes you already have `paru` installed.
+- `base-devel` is required so `paru` can build the local package.
+- `gnome-shell` provides the GNOME extension runtime and CLI tooling.
+- `usbguard` provides the daemon and D-Bus API this extension talks to.
+
+Then build and install the package from this repository:
+
+```bash
+paru -Bi packaging/arch
+```
+
+Then log out and back in so GNOME Shell sees the new system extension, and
+enable it:
+
+```bash
+gnome-extensions enable usbguard-prompt@blacksheeep
+```
+
+This installs the extension system-wide to:
+
+```text
+/usr/share/gnome-shell/extensions/usbguard-prompt@blacksheeep
+```
+
+## Arch Linux USBGuard Example
+
+Edit `/etc/usbguard/usbguard-daemon.conf` like this:
+
+```ini
+RuleFile=/etc/usbguard/rules.conf
+
+PresentDevicePolicy=allow
+InsertedDevicePolicy=apply-policy
+
+IPCAllowedUsers=root your-user
+IPCAllowedGroups=wheel
+```
+
+Make sure the rule file exists, then enable the daemon:
+
+```bash
+sudo touch /etc/usbguard/rules.conf
+sudo chmod 0600 /etc/usbguard/rules.conf
+sudo systemctl enable --now usbguard.service usbguard-dbus.service
+```
+
+If the services are already running, restart them after changing the config:
+
+```bash
+sudo systemctl restart usbguard.service usbguard-dbus.service
+```
+
+Notes:
+
+- Replace `your-user` with your actual login name.
+- `PresentDevicePolicy=allow` keeps devices that are already connected when
+  `usbguard.service` starts usable, so your keyboard and mouse are not blocked
+  at boot or daemon start.
+- `InsertedDevicePolicy=apply-policy` keeps newly inserted devices under
+  USBGuard policy so this extension can prompt for them.
+- `RuleFile=/etc/usbguard/rules.conf` gives USBGuard a writable persistent rule
+  file for permanent allow/block decisions made through the extension.
+- `usbguard-dbus.service` publishes `org.usbguard1` on the system bus. If it is
+  not running, the extension will fail with `USBGuard D-Bus service not found`.
+- On Arch, `org.usbguard1` protects write actions such as allow/block,
+  `Set Baseline`, and permanent rule changes with polkit. The extension can use
+  the normal polkit authentication dialog for these actions.
+
+If you want NixOS-like passwordless local access for members of `wheel`, add a
+polkit rule like this:
+
+```javascript
+polkit.addRule(function(action, subject) {
+  if (!subject.active || !subject.local || !subject.isInGroup("wheel"))
+    return null;
+
+  if ([
+    "org.usbguard.Devices1.applyDevicePolicy",
+    "org.usbguard.Policy1.appendRule",
+    "org.usbguard.Policy1.removeRule",
+  ].includes(action.id)) {
+    return polkit.Result.YES;
+  }
+
+  return null;
+});
+```
+
+Save it as `/etc/polkit-1/rules.d/49-usbguard.rules`.
+
+If the extension still shows `Initialization failed`, check:
+
+```bash
+sudo systemctl status usbguard.service usbguard-dbus.service
+sudo journalctl -u usbguard.service -u usbguard-dbus.service -b --no-pager
+busctl --system list | rg usbguard
+```
+
 ## Install With Nix Flake App
 
 ```bash
