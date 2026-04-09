@@ -3,7 +3,7 @@
 GNOME Shell extension for USBGuard that gives interactive USB authorization with
 good hub behavior and practical policy management.
 
-Supported GNOME Shell version: `49`  
+Supported GNOME Shell versions: `49`, `50`  
 Extension UUID: `usbguard-prompt@blacksheeep`
 
 ## What It Does
@@ -79,7 +79,7 @@ It supports both USBGuard D-Bus variants:
 
 ## Prerequisites
 
-- GNOME Shell `49`
+- GNOME Shell `49` or `50`
 - USBGuard service running with D-Bus enabled
 - User authorized to call USBGuard policy methods
 

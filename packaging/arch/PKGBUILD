@@ -8,7 +8,7 @@ pkgname=gnome-shell-extension-usbguard-prompt
 pkgver="$(
   sed -nE 's/.*"version":[[:space:]]*([0-9]+).*/\1/p' "${_metadata_path}"
 )"
-pkgrel=4
+pkgrel=1
 pkgdesc='GNOME Shell extension for interactive USBGuard authorization'
 arch=('any')
 url='https://github.com/FHNW-Security-Lab/GnomeUSBGuard'

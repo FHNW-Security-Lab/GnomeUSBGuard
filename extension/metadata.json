@@ -3,8 +3,8 @@
   "name": "USBGuard Prompt",
   "description": "Prompt to authorize newly inserted USB devices through USBGuard.",
   "shell-version": [
-    "49"
+    "49",
+    "50"
   ],
-  "version": 14
+  "version": 15
 }
-
