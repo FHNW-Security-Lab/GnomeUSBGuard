@@ -1260,7 +1260,8 @@ class UsbGuardPromptRuntime {
             return;
         }
 
-        this._screenLocked = this._readScreenLockedState();
+        this._screenLocked = false;
+        this._readScreenLockedState();
         this._screenSignalSubscriptionId = this._sessionBus.signal_subscribe(
             SCREENSAVER_BUS_NAME,
             SCREENSAVER_INTERFACE,
@@ -1274,26 +1275,28 @@ class UsbGuardPromptRuntime {
 
     _readScreenLockedState() {
         if (!this._sessionBus)
-            return false;
+            return;
 
-        try {
-            const result = this._sessionBus.call_sync(
-                SCREENSAVER_BUS_NAME,
-                SCREENSAVER_OBJECT_PATH,
-                SCREENSAVER_INTERFACE,
-                'GetActive',
-                null,
-                new GLib.VariantType('(b)'),
-                Gio.DBusCallFlags.NONE,
-                DBUS_CALL_TIMEOUT_MS,
-                null
-            );
-            const [active] = result.deepUnpack();
-            return Boolean(active);
-        } catch (error) {
-            logException(error, 'Failed to read current lock state');
-            return false;
-        }
+        this._sessionBus.call(
+            SCREENSAVER_BUS_NAME,
+            SCREENSAVER_OBJECT_PATH,
+            SCREENSAVER_INTERFACE,
+            'GetActive',
+            null,
+            new GLib.VariantType('(b)'),
+            Gio.DBusCallFlags.NONE,
+            DBUS_CALL_TIMEOUT_MS,
+            null,
+            (connection, result) => {
+                try {
+                    const response = connection.call_finish(result);
+                    const [active] = response.deepUnpack();
+                    this._setScreenLocked(Boolean(active));
+                } catch (error) {
+                    logException(error, 'Failed to read current lock state');
+                }
+            }
+        );
     }
 
     _onScreenActiveChanged(_connection, _sender, _path, _interfaceName, _signalName, parameters) {
