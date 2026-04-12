@@ -157,6 +157,7 @@ class UsbGuardPromptRuntime {
         this._source = null;
         this._ensureNotificationSource();
 
+        this._startupToken = 0;
         this._bus = null;
         this._usbguardBackend = null;
         this._sessionBus = null;
@@ -177,42 +178,17 @@ class UsbGuardPromptRuntime {
         this._permanentRuleCacheUpdatedAtUsec = 0;
         this._permanentRuleRefreshPromise = null;
 
-        try {
-            this._bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, null);
-        } catch (error) {
-            logException(error, 'Failed to connect to the system bus');
-            Main.notifyError('USBGuard Prompt', 'Cannot connect to the system D-Bus.');
-            return;
-        }
-
-        this._usbguardBackend = this._detectUsbguardBackend();
-        if (!this._usbguardBackend) {
-            Main.notifyError(
-                'USBGuard Prompt',
-                'USBGuard D-Bus service not found (expected org.usbguard1 or org.usbguard).'
-            );
-            return;
-        }
-
-        this._signalSubscriptionId = this._bus.signal_subscribe(
-            this._usbguardBackend.busName,
-            this._usbguardBackend.devicesInterface,
-            'DevicePresenceChanged',
-            this._usbguardBackend.signalObjectPath,
-            null,
-            Gio.DBusSignalFlags.NONE,
-            this._onDevicePresenceChanged.bind(this)
-        );
-
-        this._setupScreenLockTracking();
         this._reloadTraySettings();
         this._applyTrayPreference();
         this._startSettingsPolling();
 
-        logInfo('Extension enabled');
+        const startupToken = ++this._startupToken;
+        void this._initializeAsync(startupToken);
     }
 
     disable() {
+        this._startupToken++;
+
         if (this._signalSubscriptionId > 0 && this._bus) {
             this._bus.signal_unsubscribe(this._signalSubscriptionId);
             this._signalSubscriptionId = 0;
@@ -241,6 +217,88 @@ class UsbGuardPromptRuntime {
         this._usbguardBackend = null;
         this._sessionBus = null;
         logInfo('Extension disabled');
+    }
+
+    async _initializeAsync(startupToken) {
+        try {
+            const systemBus = await this._getBusAsync(Gio.BusType.SYSTEM);
+            if (!this._isStartupCurrent(startupToken))
+                return;
+
+            this._bus = systemBus;
+            this._usbguardBackend = await this._detectUsbguardBackendAsync(systemBus, startupToken);
+            if (!this._isStartupCurrent(startupToken))
+                return;
+
+            if (!this._usbguardBackend) {
+                Main.notifyError(
+                    'USBGuard Prompt',
+                    'USBGuard D-Bus service not found (expected org.usbguard1 or org.usbguard).'
+                );
+                return;
+            }
+
+            this._signalSubscriptionId = this._bus.signal_subscribe(
+                this._usbguardBackend.busName,
+                this._usbguardBackend.devicesInterface,
+                'DevicePresenceChanged',
+                this._usbguardBackend.signalObjectPath,
+                null,
+                Gio.DBusSignalFlags.NONE,
+                this._onDevicePresenceChanged.bind(this)
+            );
+
+            this._applyTrayPreference();
+            void this._setupScreenLockTrackingAsync(startupToken);
+
+            logInfo('Extension enabled');
+        } catch (error) {
+            if (!this._isStartupCurrent(startupToken))
+                return;
+
+            logException(error, 'Failed to connect to the system bus');
+            Main.notifyError('USBGuard Prompt', 'Cannot connect to the system D-Bus.');
+        }
+    }
+
+    _isStartupCurrent(startupToken) {
+        return this._startupToken === startupToken;
+    }
+
+    _getBusAsync(busType) {
+        return new Promise((resolve, reject) => {
+            Gio.bus_get(busType, null, (_source, result) => {
+                try {
+                    resolve(Gio.bus_get_finish(result));
+                } catch (error) {
+                    reject(error);
+                }
+            });
+        });
+    }
+
+    _callBusMethodAsync(connection, busName, objectPath, interfaceName, methodName,
+        parameters, replyType, timeoutMs = DBUS_CALL_TIMEOUT_MS) {
+        return new Promise((resolve, reject) => {
+            connection.call(
+                busName,
+                objectPath,
+                interfaceName,
+                methodName,
+                parameters,
+                replyType,
+                Gio.DBusCallFlags.NONE,
+                timeoutMs,
+                null,
+                (source, result) => {
+                    try {
+                        resolve(source.call_finish(result));
+                    } catch (error) {
+                        reject(error);
+                    }
+                }
+            );
+        });
     }
 
     _configDir() {
@@ -343,7 +401,7 @@ class UsbGuardPromptRuntime {
     }
 
     _applyTrayPreference() {
-        if (this._trayEnabled)
+        if (this._trayEnabled && this._usbguardBackend)
             this._ensureTrayButton();
         else
             this._destroyTrayButton();
@@ -1034,6 +1092,13 @@ class UsbGuardPromptRuntime {
 
         this._trayButton.menu.removeAll();
 
+        if (!this._bus || !this._usbguardBackend) {
+            const item = new PopupMenu.PopupMenuItem('USBGuard not ready');
+            item.setSensitive(false);
+            this._trayButton.menu.addMenuItem(item);
+            return;
+        }
+
         let devices;
         try {
             devices = await this._listConnectedDevices();
@@ -1174,34 +1239,36 @@ class UsbGuardPromptRuntime {
         }
     }
 
-    _detectUsbguardBackend() {
+    async _detectUsbguardBackendAsync(connection, startupToken) {
         for (const backend of USBGUARD_BACKENDS) {
-            if (this._ensureBusNameAvailable(backend.busName))
+            if (!this._isStartupCurrent(startupToken))
+                return null;
+
+            if (await this._ensureBusNameAvailableAsync(connection, backend.busName))
                 return backend;
         }
+
         return null;
     }
 
-    _ensureBusNameAvailable(busName) {
-        if (this._hasBusOwner(busName))
+    async _ensureBusNameAvailableAsync(connection, busName) {
+        if (await this._hasBusOwnerAsync(connection, busName))
             return true;
-        if (!this._isBusNameActivatable(busName))
+        if (!await this._isBusNameActivatableAsync(connection, busName))
             return false;
-        return this._startBusService(busName);
+        return this._startBusServiceAsync(connection, busName);
     }
 
-    _hasBusOwner(busName) {
+    async _hasBusOwnerAsync(connection, busName) {
         try {
-            const response = this._bus.call_sync(
+            const response = await this._callBusMethodAsync(
+                connection,
                 'org.freedesktop.DBus',
                 '/org/freedesktop/DBus',
                 'org.freedesktop.DBus',
                 'NameHasOwner',
                 new GLib.Variant('(s)', [busName]),
-                new GLib.VariantType('(b)'),
-                Gio.DBusCallFlags.NONE,
-                DBUS_CALL_TIMEOUT_MS,
-                null
+                new GLib.VariantType('(b)')
             );
             const [hasOwner] = response.deepUnpack();
             return Boolean(hasOwner);
@@ -1211,18 +1278,16 @@ class UsbGuardPromptRuntime {
         }
     }
 
-    _isBusNameActivatable(busName) {
+    async _isBusNameActivatableAsync(connection, busName) {
         try {
-            const response = this._bus.call_sync(
+            const response = await this._callBusMethodAsync(
+                connection,
                 'org.freedesktop.DBus',
                 '/org/freedesktop/DBus',
                 'org.freedesktop.DBus',
                 'ListActivatableNames',
                 null,
-                new GLib.VariantType('(as)'),
-                Gio.DBusCallFlags.NONE,
-                DBUS_CALL_TIMEOUT_MS,
-                null
+                new GLib.VariantType('(as)')
             );
             const [names] = response.deepUnpack();
             return Array.isArray(names) && names.includes(busName);
@@ -1232,18 +1297,16 @@ class UsbGuardPromptRuntime {
         }
     }
 
-    _startBusService(busName) {
+    async _startBusServiceAsync(connection, busName) {
         try {
-            this._bus.call_sync(
+            await this._callBusMethodAsync(
+                connection,
                 'org.freedesktop.DBus',
                 '/org/freedesktop/DBus',
                 'org.freedesktop.DBus',
                 'StartServiceByName',
                 new GLib.Variant('(su)', [busName, 0]),
-                new GLib.VariantType('(u)'),
-                Gio.DBusCallFlags.NONE,
-                DBUS_CALL_TIMEOUT_MS,
-                null
+                new GLib.VariantType('(u)')
             );
             return true;
         } catch (error) {
@@ -1252,10 +1315,17 @@ class UsbGuardPromptRuntime {
         }
     }
 
-    _setupScreenLockTracking() {
+    async _setupScreenLockTrackingAsync(startupToken) {
         try {
-            this._sessionBus = Gio.bus_get_sync(Gio.BusType.SESSION, null);
+            const sessionBus = await this._getBusAsync(Gio.BusType.SESSION);
+            if (!this._isStartupCurrent(startupToken))
+                return;
+
+            this._sessionBus = sessionBus;
         } catch (error) {
+            if (!this._isStartupCurrent(startupToken))
+                return;
+
             logException(error, 'Failed to connect to session bus for lock tracking');
             return;
         }
@@ -2095,6 +2165,9 @@ class UsbGuardPromptRuntime {
     }
 
     _callUsbguardMethod(objectPath, methodName, parameters, replyType, interfaceName = null) {
+        if (!this._bus || !this._usbguardBackend)
+            return Promise.reject(new Error('USBGuard backend not initialized'));
+
         const timeoutMs = ['applyDevicePolicy', 'removeRule'].includes(methodName)
             ? DBUS_INTERACTIVE_CALL_TIMEOUT_MS
             : DBUS_CALL_TIMEOUT_MS;

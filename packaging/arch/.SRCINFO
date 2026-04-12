@@ -1,6 +1,6 @@
 pkgbase = gnome-shell-extension-usbguard-prompt
 	pkgdesc = GNOME Shell extension for interactive USBGuard authorization
-	pkgver = 15
+	pkgver = 16
 	pkgrel = 1
 	url = https://github.com/FHNW-Security-Lab/GnomeUSBGuard
 	install = gnome-shell-extension-usbguard-prompt.install
